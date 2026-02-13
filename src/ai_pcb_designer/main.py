@@ -79,8 +79,20 @@ def main() -> None:
 
 def _run_gui() -> None:
     """Launch the GUI application."""
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtCore import Qt
+    try:
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import Qt
+    except ImportError:
+        print("ERROR: PySide6 is not installed for this Python interpreter.")
+        print(f"  Python executable: {sys.executable}")
+        print(f"  Python version:    {sys.version}")
+        print()
+        print("Fix: install PySide6 for THIS Python version:")
+        print(f"  {sys.executable} -m pip install PySide6")
+        print()
+        print("Or run in CLI mode (no GUI needed):")
+        print("  python -m ai_pcb_designer --cli --template esp32_carrier")
+        sys.exit(1)
 
     app = QApplication(sys.argv)
     app.setApplicationName("AI PCB Designer")

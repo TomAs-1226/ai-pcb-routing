@@ -46,32 +46,64 @@ All steps are visualized in real-time in the GUI.
 - PySide6 (Qt6) for the GUI
 - numpy, shapely for geometry
 
-### Install
+### Easiest Way (macOS / Linux)
+
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+The launcher auto-detects the right Python, installs dependencies if needed, and starts the app.
+
+### Easiest Way (Windows)
+
+```cmd
+run.bat
+```
+
+### Manual Install
+
+**Important on macOS**: If you have multiple Python versions, make sure to use the same one for installing and running:
+
+```bash
+# Check which python you're using
+python3 --version
+
+# Install deps with THAT python
+python3 -m pip install PySide6 numpy shapely
+
+# Run with THAT python
+PYTHONPATH=src python3 -m ai_pcb_designer
+```
+
+Or install as an editable package:
 
 ```bash
 pip install -e ".[dev]"
+python -m ai_pcb_designer
 ```
 
 ### Quick Start - GUI Mode
 
 ```bash
-python -m ai_pcb_designer
+./run.sh                    # macOS/Linux
+run.bat                     # Windows
 ```
 
-### Quick Start - CLI Mode
+### Quick Start - CLI Mode (no GUI needed)
 
 ```bash
 # Design using a template
-python -m ai_pcb_designer --cli --template esp32_carrier
+PYTHONPATH=src python3 -m ai_pcb_designer --cli --template esp32_carrier
 
 # Design from description
-python -m ai_pcb_designer --cli "Make me an ESP32 dev board with USB and LEDs"
+PYTHONPATH=src python3 -m ai_pcb_designer --cli "Make me an ESP32 dev board with USB and LEDs"
 
 # List available templates
-python -m ai_pcb_designer --list-templates
+PYTHONPATH=src python3 -m ai_pcb_designer --list-templates
 
 # Specify output directory
-python -m ai_pcb_designer --cli --template led_blinker --output ./my_board
+PYTHONPATH=src python3 -m ai_pcb_designer --cli --template led_blinker --output ./my_board
 ```
 
 ### With LLM (Optional)
