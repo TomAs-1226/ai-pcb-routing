@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "ai-pcb-designer"
+version = "0.1.0"
+description = "AI-powered autonomous PCB design tool for beginners"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6.0",
+    "numpy>=1.24.0",
+    "shapely>=2.0.0",
+    "gerber-writer>=0.4.0",
+    "gerbonara>=1.3.0",
+    "kiutils>=1.4.0",
+    "openai>=1.12.0",
+    "anthropic>=0.18.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-qt>=4.2.0",
+    "ruff>=0.3.0",
+]
+
+[project.scripts]
+ai-pcb-designer = "ai_pcb_designer.main:main"
+
+[project.gui-scripts]
+ai-pcb-designer-gui = "ai_pcb_designer.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
