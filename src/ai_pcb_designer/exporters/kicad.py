@@ -14,7 +14,7 @@ from textwrap import indent
 from ..core.board import Board
 from ..core.component import Component
 from ..core.datatypes import Layer, PadShape, PadType, Point
-from ..core.trace import TraceSegment, Via
+from ..core.trace import CopperZone, TraceSegment, Via
 
 
 class KiCadExporter:
@@ -50,6 +50,9 @@ class KiCadExporter:
 
         for via in board.get_all_vias():
             parts.append(self._via(via))
+
+        for zone in board.zones:
+            parts.append(self._zone(zone))
 
         # Board outline
         parts.append(self._board_outline())
@@ -183,6 +186,20 @@ class KiCadExporter:
             f'  (via (at {via.position.x:.4f} {via.position.y:.4f}) '
             f'(size {via.diameter:.4f}) (drill {via.drill:.4f}) '
             f'(layers "F.Cu" "B.Cu") (net {via.net_id}))'
+        )
+
+    def _zone(self, zone: CopperZone) -> str:
+        """Generate zone S-expression."""
+        net = self.board.get_net_by_id(zone.net_id)
+        net_name = net.name if net else ""
+        layer = zone.layer.value
+        points = " ".join(f"(xy {p.x:.4f} {p.y:.4f})" for p in zone.outline)
+        return (
+            f'  (zone (net {zone.net_id}) (net_name "{net_name}") (layer "{layer}")\n'
+            f'    (fill yes (thermal_gap 0.508) (thermal_bridge_width 0.508))\n'
+            f'    (connect_pads (clearance {zone.clearance:.4f}))\n'
+            f'    (polygon (pts {points}))\n'
+            f'  )'
         )
 
     def _board_outline(self) -> str:

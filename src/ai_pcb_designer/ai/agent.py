@@ -22,9 +22,7 @@ Pipeline:
 from __future__ import annotations
 
 import copy
-import json
 import math
-import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -40,13 +38,13 @@ from ..components.templates import (
     list_templates,
 )
 from ..components.database import ComponentDatabase
-from ..engines.schematic import SchematicEngine
 from ..engines.placer import PlacementEngine, PlacementConfig, estimate_board_size
 from ..engines.router import AutoRouter, RouterConfig
 from ..engines.drc import DRCEngine, DRCResult, DRCViolationType
 from ..exporters.gerber import GerberExporter
 from ..exporters.bom import BOMExporter, PickAndPlaceExporter
 from ..exporters.kicad import KiCadExporter
+from ..exporters.assembly import AssemblyDrawingExporter
 
 
 class AgentPhase(Enum):
@@ -186,37 +184,48 @@ class PCBDesignAgent:
                 return None
 
             # Phase 3: Component placement
-            self._emit(
-                AgentPhase.PLACING_COMPONENTS,
-                "Placing components on the board...",
-                f"Force-directed placement for {len(board.components)} components",
-                progress=0.18,
-            )
+            # Check if components already have positions (from DSL templates)
+            has_positions = self._components_have_positions(board)
 
-            placer = PlacementEngine(PlacementConfig(seed=42))
+            if has_positions:
+                self._emit(
+                    AgentPhase.PLACING_COMPONENTS,
+                    "Components have pre-calculated positions (deterministic layout)",
+                    f"{len(board.components)} components already placed by design template",
+                    progress=0.40,
+                    board=board,
+                )
+            else:
+                self._emit(
+                    AgentPhase.PLACING_COMPONENTS,
+                    "Placing components on the board...",
+                    f"Force-directed placement for {len(board.components)} components",
+                    progress=0.18,
+                )
 
-            placement_emit_count = [0]
-            def on_placement_step(step):
-                placement_emit_count[0] += 1
-                # Throttle: only emit every 5th placement step
-                if placement_emit_count[0] % 5 == 0:
-                    self._emit(
-                        AgentPhase.PLACING_COMPONENTS,
-                        step.message,
-                        f"Iteration {step.iteration}, force: {step.total_force:.3f}",
-                        progress=0.20 + 0.20 * min(step.iteration / 300, 1.0),
-                        board=board,
-                    )
+                placer = PlacementEngine(PlacementConfig(seed=42))
 
-            placer.set_step_callback(on_placement_step)
-            placer.place(board)
+                placement_emit_count = [0]
+                def on_placement_step(step):
+                    placement_emit_count[0] += 1
+                    if placement_emit_count[0] % 5 == 0:
+                        self._emit(
+                            AgentPhase.PLACING_COMPONENTS,
+                            step.message,
+                            f"Iteration {step.iteration}, force: {step.total_force:.3f}",
+                            progress=0.20 + 0.20 * min(step.iteration / 300, 1.0),
+                            board=board,
+                        )
 
-            self._emit(
-                AgentPhase.PLACING_COMPONENTS,
-                "Component placement complete!",
-                progress=0.40,
-                board=board,
-            )
+                placer.set_step_callback(on_placement_step)
+                placer.place(board)
+
+                self._emit(
+                    AgentPhase.PLACING_COMPONENTS,
+                    "Component placement complete!",
+                    progress=0.40,
+                    board=board,
+                )
 
             if self._is_cancelled():
                 return None
@@ -344,11 +353,35 @@ class PCBDesignAgent:
             )
             return None
 
+    # ─── Helpers ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _components_have_positions(board: Board) -> bool:
+        """Check if components already have non-origin positions (from DSL)."""
+        placed = 0
+        for comp in board.components:
+            if abs(comp.position.x) > 0.1 or abs(comp.position.y) > 0.1:
+                placed += 1
+        # If more than half have positions, consider it pre-placed
+        return placed > len(board.components) * 0.5
+
     # ─── Board Sizing ────────────────────────────────────────────────────
 
     def _size_board(self, board: Board) -> None:
         """Auto-size board or validate user-requested size."""
         cfg = self.config
+
+        # If components already have positions (DSL templates), trust the board size
+        if self._components_have_positions(board):
+            self._emit(
+                AgentPhase.SIZING_BOARD,
+                f"Using template board size: {board.settings.width}x{board.settings.height}mm",
+                f"Components are pre-placed for this board size",
+                progress=0.15,
+                board=board,
+            )
+            return
+
         est_w, est_h = estimate_board_size(board)
 
         if cfg.user_width > 0 and cfg.user_height > 0:
@@ -460,40 +493,40 @@ class PCBDesignAgent:
         footprints = list_footprints()
 
         return f"""You are an expert PCB design engineer. Given a user's description of a
-PCB they want to create, generate a complete board specification as JSON.
+PCB they want to create, generate Python code using the PCBDesign DSL.
 
 Available footprints: {', '.join(footprints)}
 
-Available template designs for reference: {json.dumps(templates, indent=2)}
+Your output MUST be Python code that creates a board using this API:
 
-Your output MUST be valid JSON with this structure:
-{{
-  "name": "Board Name",
-  "description": "Brief description",
-  "width": 50.0,
-  "height": 40.0,
-  "components": [
-    {{
-      "reference": "U1",
-      "value": "ESP32-WROOM-32",
-      "footprint": "ESP32-WROOM-32",
-      "pins": {{"1": "GND", "2": "3V3"}},
-      "manufacturer": "Espressif",
-      "mpn": "ESP32-WROOM-32E",
-      "description": "WiFi+BT module"
-    }}
-  ]
-}}
+```python
+from ai_pcb_designer.ai.pcb_dsl import PCBDesign
+
+pcb = PCBDesign("Board Name", width=70.0, height=55.0, description="...")
+
+# Place components at specific positions
+u1 = pcb.place("U1", "ESP32-WROOM-32", value="ESP32-WROOM-32",
+                pos=(35, 28), description="Main MCU")
+r1 = pcb.place("R1", "R_0603", value="10k", pos=(20, 15))
+
+# Define nets connecting component pins
+pcb.power_net("3V3", [(u1, "2"), (r1, "1")])  # Power net (wider trace)
+pcb.net("SIGNAL", [(u1, "25"), (r1, "2")])     # Signal net
+
+board = pcb.build()
+```
 
 Rules:
-- Use standard reference designator prefixes (U for ICs, R for resistors,
-  C for capacitors, D for diodes/LEDs, J for connectors, SW for switches,
-  H for mounting holes)
-- Always include decoupling capacitors near ICs
-- Always include pull-up/pull-down resistors where needed
-- Include appropriate power filtering
-- Board dimensions should be reasonable for the component count
-- Pin net names should be consistent (GND, 3V3, 5V, etc.)
+- Use standard reference designator prefixes (U, R, C, D, J, SW, H)
+- Always include decoupling capacitors within 3mm of IC power pins
+- Always include pull-up resistors for enable/reset pins
+- Place connectors at board edges, ICs centered, passives near their ICs
+- Board dimensions should fit all components with routing space
+- Use power_net() for GND, VCC, 3V3, 5V, VBUS
+- Every pin that needs connection must be in a net
+- Component positions must be inside the board boundaries
+
+Output ONLY the Python code, no explanations.
 """
 
     def _build_user_prompt(self, request: str) -> str:
@@ -501,8 +534,9 @@ Rules:
 
 {request}
 
-Generate the complete board specification as JSON. Include all necessary
-support components (decoupling caps, pull-up resistors, connectors, etc.)."""
+Generate Python code using the PCBDesign DSL. Include all necessary support
+components (decoupling caps, pull-up resistors, connectors, etc.).
+Output only the Python code."""
 
     def _call_openai(self, system_prompt: str, user_prompt: str) -> Board | None:
         try:
@@ -517,7 +551,6 @@ support components (decoupling caps, pull-up resistors, connectors, etc.)."""
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            response_format={"type": "json_object"},
             temperature=0.3,
         )
 
@@ -525,9 +558,7 @@ support components (decoupling caps, pull-up resistors, connectors, etc.)."""
         if not content:
             return None
 
-        spec = json.loads(content)
-        engine = SchematicEngine()
-        return engine.generate_from_spec(spec)
+        return self._execute_llm_code(content)
 
     def _call_anthropic(self, system_prompt: str, user_prompt: str) -> Board | None:
         try:
@@ -546,15 +577,76 @@ support components (decoupling caps, pull-up resistors, connectors, etc.)."""
         )
 
         content = response.content[0].text
-        try:
-            start = content.index("{")
-            end = content.rindex("}") + 1
-            spec = json.loads(content[start:end])
-        except (ValueError, json.JSONDecodeError):
+        if not content:
             return None
 
-        engine = SchematicEngine()
-        return engine.generate_from_spec(spec)
+        return self._execute_llm_code(content)
+
+    def _execute_llm_code(self, code: str) -> Board | None:
+        """Execute Python DSL code generated by an LLM and return the Board.
+
+        Extracts Python code from markdown fences if present, then executes
+        it in a clean namespace with the PCBDesign class available.  Looks
+        for a ``board`` variable (Board instance) or a ``pcb`` variable
+        (PCBDesign instance, calling ``.build()`` on it) in the resulting
+        namespace.
+
+        Returns the Board on success, or None on failure.
+        """
+        import re
+        from .pcb_dsl import PCBDesign
+
+        # Extract code from ```python ... ``` fences if present
+        fence_match = re.search(
+            r"```(?:python)?\s*\n(.*?)```", code, re.DOTALL
+        )
+        if fence_match:
+            code = fence_match.group(1)
+
+        # Build a clean namespace with the DSL class available.
+        # The LLM code typically does `from ai_pcb_designer.ai.pcb_dsl import PCBDesign`
+        # which would fail inside exec, so we strip that import and inject
+        # the class directly.
+        code = re.sub(
+            r"^\s*from\s+\S*pcb_dsl\s+import\s+.*$",
+            "",
+            code,
+            flags=re.MULTILINE,
+        )
+
+        namespace: dict[str, Any] = {"PCBDesign": PCBDesign}
+
+        try:
+            exec(code, namespace)  # noqa: S102
+        except Exception as exc:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"LLM-generated code execution failed: {exc}",
+                detail=code,
+            )
+            return None
+
+        # Look for a Board object first, then a PCBDesign to build
+        if "board" in namespace and isinstance(namespace["board"], Board):
+            return namespace["board"]
+
+        if "pcb" in namespace and isinstance(namespace["pcb"], PCBDesign):
+            try:
+                return namespace["pcb"].build()
+            except Exception as exc:
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    f"PCBDesign.build() failed: {exc}",
+                    detail=code,
+                )
+                return None
+
+        self._emit(
+            AgentPhase.ANALYZING,
+            "LLM code did not produce a 'board' or 'pcb' variable",
+            detail=code,
+        )
+        return None
 
     # ─── DRC Fix ─────────────────────────────────────────────────────────
 
@@ -659,6 +751,16 @@ support components (decoupling caps, pull-up resistors, connectors, etc.)."""
                 "KiCad file generated",
                 progress=0.97,
             )
+
+        # Assembly drawing
+        assy_path = output_dir / "Assembly_Drawing.svg"
+        AssemblyDrawingExporter(board).export(assy_path)
+        files.append(str(assy_path))
+        self._emit(
+            AgentPhase.GENERATING_OUTPUTS,
+            "Assembly drawing generated",
+            progress=0.98,
+        )
 
         return files
 

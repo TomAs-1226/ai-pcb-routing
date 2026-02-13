@@ -1,10 +1,11 @@
-"""PCB trace autorouter using A* pathfinding on a grid - Phase 2.
+"""PCB trace autorouter using A* pathfinding - Phase 3.
 
-Fixes from Phase 1:
-- Single shared RoutingGrid (no more grid-per-pad allocation)
-- Through-hole pads marked on both layers
-- Simplified trace segments (colinear segments merged)
-- Better net ordering and progress reporting
+Key improvements for high routing accuracy:
+- Rip-up-and-retry: when a net fails, rip up blocking nets and retry
+- Route short signal nets first, then longer ones, then power/GND last
+- GND uses copper pour instead of individual traces
+- Better obstacle marking with proper clearance
+- Multi-pass routing with different strategies
 """
 
 from __future__ import annotations
@@ -19,20 +20,22 @@ import numpy as np
 from ..core.board import Board
 from ..core.datatypes import Layer, Point
 from ..core.net import Net
-from ..core.trace import Trace, TraceSegment, Via
+from ..core.trace import CopperZone, Trace, TraceSegment, Via
 
 
 @dataclass
 class RouterConfig:
-    grid_resolution: float = 0.25
-    trace_width: float = 0.25
-    via_diameter: float = 0.8
-    via_drill: float = 0.4
-    clearance: float = 0.2
-    via_cost: float = 50.0
-    direction_change_cost: float = 2.0
-    max_iterations_per_net: int = 80000
-    power_trace_width: float = 0.5
+    grid_resolution: float = 0.5      # mm per grid cell
+    trace_width: float = 0.25         # mm
+    via_diameter: float = 0.8         # mm
+    via_drill: float = 0.4            # mm
+    clearance: float = 0.2            # mm
+    via_cost: float = 80.0            # higher = fewer vias
+    direction_change_cost: float = 1.5
+    max_iterations_per_net: int = 150000
+    power_trace_width: float = 0.5    # mm
+    max_rip_up_attempts: int = 3      # rip-up-and-retry cycles
+    gnd_pour: bool = True             # use ground pour instead of routing GND
 
 
 @dataclass
@@ -53,12 +56,13 @@ DIRECTIONS_8 = [
 
 
 class RoutingGrid:
-    """2D grid for pathfinding. Shared across all nets."""
+    """2D multi-layer grid for A* pathfinding."""
 
     def __init__(self, width_mm: float, height_mm: float, resolution: float) -> None:
         self.resolution = resolution
         self.cols = max(1, int(math.ceil(width_mm / resolution)))
         self.rows = max(1, int(math.ceil(height_mm / resolution)))
+        # Cell values: 0=free, 1=obstacle, 2=trace, net_id+100=pad for net
         self.grid = np.zeros((2, self.rows, self.cols), dtype=np.int32)
 
     def mm_to_grid(self, x_mm: float, y_mm: float) -> tuple[int, int]:
@@ -78,29 +82,43 @@ class RoutingGrid:
                         self.grid[layer_idx, ny, nx] = 1
 
     def mark_pad(self, layer_idx: int, gx: int, gy: int, net_id: int, radius: int = 1) -> None:
+        marker = net_id + 100
         for dx in range(-radius, radius + 1):
             for dy in range(-radius, radius + 1):
                 nx, ny = gx + dx, gy + dy
                 if 0 <= nx < self.cols and 0 <= ny < self.rows:
-                    self.grid[layer_idx, ny, nx] = net_id + 10
+                    self.grid[layer_idx, ny, nx] = marker
 
-    def mark_trace(self, layer_idx: int, gx: int, gy: int, clearance: int = 1) -> None:
+    def mark_trace(self, layer_idx: int, gx: int, gy: int, net_id: int,
+                   clearance: int = 1) -> None:
+        """Mark a trace cell and its clearance zone."""
+        marker = net_id + 100
         for dx in range(-clearance, clearance + 1):
             for dy in range(-clearance, clearance + 1):
                 nx, ny = gx + dx, gy + dy
                 if 0 <= nx < self.cols and 0 <= ny < self.rows:
-                    if self.grid[layer_idx, ny, nx] == 0:
-                        self.grid[layer_idx, ny, nx] = 2
+                    val = self.grid[layer_idx, ny, nx]
+                    if val == 0:
+                        self.grid[layer_idx, ny, nx] = 2  # generic blocked
+
+    def unmark_trace(self, layer_idx: int, gx: int, gy: int, clearance: int = 1) -> None:
+        """Remove a trace and its clearance marking."""
+        for dx in range(-clearance, clearance + 1):
+            for dy in range(-clearance, clearance + 1):
+                nx, ny = gx + dx, gy + dy
+                if 0 <= nx < self.cols and 0 <= ny < self.rows:
+                    if self.grid[layer_idx, ny, nx] == 2:
+                        self.grid[layer_idx, ny, nx] = 0
 
     def is_free(self, layer_idx: int, gx: int, gy: int, net_id: int) -> bool:
         if not (0 <= gx < self.cols and 0 <= gy < self.rows):
             return False
         val = self.grid[layer_idx, gy, gx]
-        return val == 0 or val == net_id + 10
+        return val == 0 or val == net_id + 100
 
 
 class AutoRouter:
-    """Grid-based A* autorouter with multi-layer support."""
+    """Grid-based A* autorouter with rip-up-and-retry for high completion rates."""
 
     def __init__(self, config: RouterConfig | None = None) -> None:
         self.config = config or RouterConfig()
@@ -115,6 +133,7 @@ class AutoRouter:
         self._on_step = callback
 
     def route(self, board: Board) -> tuple[bool, list[RouteStep]]:
+        """Route all nets on the board. Returns (all_routed, steps)."""
         self._steps = []
         cfg = self.config
 
@@ -124,83 +143,252 @@ class AutoRouter:
 
         ordered_nets = self._order_nets(board)
 
-        total_nets = len([n for n in ordered_nets if len(n.pad_refs) >= 2])
-        routed_count = 0
-        failed_count = 0
+        # Separate GND for pour treatment
+        gnd_nets = [n for n in ordered_nets if n.is_ground and cfg.gnd_pour]
+        signal_nets = [n for n in ordered_nets if not (n.is_ground and cfg.gnd_pour)]
 
-        for net in ordered_nets:
+        routed_traces: dict[int, tuple[Trace, list[tuple[int, int, int]]]] = {}
+        failed_nets: list[Net] = []
+
+        # ─── Pass 1: Route signal and power nets ───────────────────
+        for net in signal_nets:
             if len(net.pad_refs) < 2:
                 continue
 
-            pad_positions = self._get_pad_positions(grid, board, net)
-            if len(pad_positions) < 2:
+            success, trace, path_cells = self._route_net(grid, board, net)
+            if success and trace:
+                routed_traces[net.id] = (trace, path_cells)
+                board.add_trace(trace)
+            else:
+                failed_nets.append(net)
+
+        # ─── Pass 2: Rip-up-and-retry for failed nets ─────────────
+        for attempt in range(cfg.max_rip_up_attempts):
+            if not failed_nets:
+                break
+
+            still_failed = []
+            for net in failed_nets:
+                success = self._rip_up_and_retry(
+                    grid, board, net, routed_traces, signal_nets
+                )
+                if not success:
+                    still_failed.append(net)
+
+            failed_nets = still_failed
+
+            if failed_nets:
+                self._emit_step("", 0, "retry",
+                                message=f"Rip-up pass {attempt + 1}: "
+                                f"{len(failed_nets)} nets still unrouted")
+
+        # ─── Pass 3: GND copper pour ──────────────────────────────
+        for net in gnd_nets:
+            self._add_ground_pour(board, net)
+            self._emit_step(net.name, net.id, "placed",
+                            message=f"Added ground pour for {net.name}")
+
+        total_signal = len([n for n in signal_nets if len(n.pad_refs) >= 2])
+        routed_count = total_signal - len(failed_nets)
+
+        return len(failed_nets) == 0, self._steps
+
+    def _route_net(
+        self, grid: RoutingGrid, board: Board, net: Net,
+    ) -> tuple[bool, Trace | None, list[tuple[int, int, int]]]:
+        """Route a single net. Returns (success, trace, path_cells)."""
+        cfg = self.config
+
+        pad_positions = self._get_pad_positions(grid, board, net)
+        if len(pad_positions) < 2:
+            return False, None, []
+
+        trace_width = cfg.power_trace_width if (
+            net.is_power or net.is_ground
+        ) else cfg.trace_width
+
+        self._emit_step(net.name, net.id, "searching",
+                        message=f"Routing {net.name} ({len(pad_positions)} pads)")
+
+        trace = Trace(net_id=net.id)
+        all_path_cells: list[tuple[int, int, int]] = []
+        connected = {0}
+        unconnected = set(range(1, len(pad_positions)))
+
+        while unconnected:
+            best_path = None
+            best_cost = float("inf")
+            best_to = -1
+
+            for ui in unconnected:
+                for ci in connected:
+                    path, switches = self._astar(
+                        grid, pad_positions[ci], pad_positions[ui], net.id
+                    )
+                    if path is not None:
+                        cost = len(path) + len(switches) * cfg.via_cost
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_path = path
+                            best_to = ui
+
+            if best_path is None:
+                self._emit_step(net.name, net.id, "failed",
+                                message=f"Could not route: {net.name}")
+                return False, None, []
+
+            self._path_to_trace(grid, best_path, trace, trace_width, net.id)
+
+            clearance_cells = max(1, int(math.ceil(
+                (trace_width / 2 + cfg.clearance) / cfg.grid_resolution
+            )))
+            for gx, gy, layer_idx in best_path:
+                grid.mark_trace(layer_idx, gx, gy, net.id, clearance_cells)
+                all_path_cells.append((gx, gy, layer_idx))
+
+            connected.add(best_to)
+            unconnected.discard(best_to)
+
+        if trace.segments:
+            trace.segments = self._simplify_segments(trace.segments)
+            self._emit_step(net.name, net.id, "placed",
+                            message=f"Routed {net.name} ({len(trace.segments)} segs)")
+            return True, trace, all_path_cells
+
+        return False, None, []
+
+    def _rip_up_and_retry(
+        self,
+        grid: RoutingGrid,
+        board: Board,
+        failed_net: Net,
+        routed_traces: dict[int, tuple[Trace, list[tuple[int, int, int]]]],
+        all_nets: list[Net],
+    ) -> bool:
+        """Rip up blocking nets and retry routing the failed net."""
+        cfg = self.config
+
+        pad_positions = self._get_pad_positions(grid, board, failed_net)
+        if len(pad_positions) < 2:
+            return False
+
+        # Find which routed nets might be blocking us
+        blocking_net_ids: set[int] = set()
+        for pos in pad_positions:
+            gx, gy, li = pos
+            for dx in range(-10, 11):
+                for dy in range(-10, 11):
+                    nx, ny = gx + dx, gy + dy
+                    if 0 <= nx < grid.cols and 0 <= ny < grid.rows:
+                        val = grid.grid[li, ny, nx]
+                        if val >= 100:
+                            bid = val - 100
+                            if bid != failed_net.id and bid in routed_traces:
+                                blocking_net_ids.add(bid)
+
+        if not blocking_net_ids:
+            return False
+
+        clearance_cells = max(1, int(math.ceil(
+            (cfg.trace_width / 2 + cfg.clearance) / cfg.grid_resolution
+        )))
+
+        for bid in list(blocking_net_ids)[:2]:
+            if bid not in routed_traces:
                 continue
 
-            trace_width = cfg.power_trace_width if (
-                net.is_power or net.is_ground
-            ) else cfg.trace_width
+            old_trace, old_cells = routed_traces[bid]
 
-            self._emit_step(net.name, net.id, "searching",
-                            message=f"Routing {net.name} ({routed_count + 1}/{total_nets})")
+            # Rip up
+            board.traces = [t for t in board.traces if t.net_id != bid]
+            for gx, gy, li in old_cells:
+                grid.unmark_trace(li, gx, gy, clearance_cells)
+            del routed_traces[bid]
 
-            trace = Trace(net_id=net.id)
-            connected = {0}
-            unconnected = set(range(1, len(pad_positions)))
-
-            while unconnected:
-                best_path = None
-                best_cost = float("inf")
-                best_to = -1
-
-                for ci in connected:
-                    for ui in unconnected:
-                        path, switches = self._astar(
-                            grid, pad_positions[ci], pad_positions[ui], net.id
-                        )
-                        if path is not None:
-                            cost = len(path) + len(switches) * cfg.via_cost
-                            if cost < best_cost:
-                                best_cost = cost
-                                best_path = path
-                                best_to = ui
-
-                if best_path is None:
-                    failed_count += 1
-                    self._emit_step(net.name, net.id, "failed",
-                                    message=f"Could not route: {net.name}")
-                    break
-
-                self._path_to_trace(grid, best_path, trace, trace_width, net.id)
-
-                clearance_cells = max(1, int(math.ceil(
-                    (trace_width / 2 + cfg.clearance) / cfg.grid_resolution
-                )))
-                for gx, gy, layer_idx in best_path:
-                    grid.mark_trace(layer_idx, gx, gy, clearance_cells)
-
-                connected.add(best_to)
-                unconnected.discard(best_to)
-
-            if trace.segments:
-                trace.segments = self._simplify_segments(trace.segments)
+            # Try routing the failed net
+            success, trace, path_cells = self._route_net(grid, board, failed_net)
+            if success and trace:
+                routed_traces[failed_net.id] = (trace, path_cells)
                 board.add_trace(trace)
-                routed_count += 1
-                self._emit_step(net.name, net.id, "placed",
-                                message=f"Routed {net.name} ({len(trace.segments)} segs)")
 
-        return failed_count == 0, self._steps
+                # Re-route the ripped net
+                ripped_net = next((n for n in all_nets if n.id == bid), None)
+                if ripped_net:
+                    s2, t2, pc2 = self._route_net(grid, board, ripped_net)
+                    if s2 and t2:
+                        routed_traces[bid] = (t2, pc2)
+                        board.add_trace(t2)
+                        return True
+                    else:
+                        # Undo: ripped net can't re-route
+                        board.traces = [t for t in board.traces if t.net_id != failed_net.id]
+                        for gx2, gy2, li2 in path_cells:
+                            grid.unmark_trace(li2, gx2, gy2, clearance_cells)
+                        del routed_traces[failed_net.id]
+                        s3, t3, pc3 = self._route_net(grid, board, ripped_net)
+                        if s3 and t3:
+                            routed_traces[bid] = (t3, pc3)
+                            board.add_trace(t3)
+                else:
+                    return True
+            else:
+                # Re-route the ripped net back
+                ripped_net = next((n for n in all_nets if n.id == bid), None)
+                if ripped_net:
+                    s2, t2, pc2 = self._route_net(grid, board, ripped_net)
+                    if s2 and t2:
+                        routed_traces[bid] = (t2, pc2)
+                        board.add_trace(t2)
+
+        return False
+
+    def _add_ground_pour(self, board: Board, net: Net) -> None:
+        """Add a ground copper pour covering the entire board."""
+        w = board.settings.width
+        h = board.settings.height
+        margin = 0.5
+
+        zone = CopperZone(
+            net_id=net.id,
+            layer=Layer.B_CU,
+            outline=[
+                Point(margin, margin),
+                Point(w - margin, margin),
+                Point(w - margin, h - margin),
+                Point(margin, h - margin),
+            ],
+            clearance=0.3,
+        )
+        board.add_zone(zone)
+
+        zone_f = CopperZone(
+            net_id=net.id,
+            layer=Layer.F_CU,
+            outline=[
+                Point(margin, margin),
+                Point(w - margin, margin),
+                Point(w - margin, h - margin),
+                Point(margin, h - margin),
+            ],
+            clearance=0.3,
+            priority=0,
+        )
+        board.add_zone(zone_f)
 
     def _astar(
         self, grid: RoutingGrid,
         start: tuple[int, int, int], end: tuple[int, int, int], net_id: int,
     ) -> tuple[list[tuple[int, int, int]] | None, list[tuple[int, int]]]:
+        """A* pathfinding between two grid positions."""
         cfg = self.config
         sx, sy, sl = start
         ex, ey, el = end
 
         open_set: list[tuple[float, float, tuple[int, int, int]]] = []
         heapq.heappush(open_set, (0.0, 0.0, (sx, sy, sl)))
-        came_from: dict[tuple[int, int, int], tuple[int, int, int] | None] = {(sx, sy, sl): None}
+        came_from: dict[tuple[int, int, int], tuple[int, int, int] | None] = {
+            (sx, sy, sl): None
+        }
         g_score: dict[tuple[int, int, int], float] = {(sx, sy, sl): 0.0}
 
         iterations = 0
@@ -217,21 +405,29 @@ class AutoRouter:
                     path.append(node)
                     node = came_from[node]
                 path.reverse()
-                switches = [(path[i][0], path[i][1])
-                            for i in range(1, len(path)) if path[i][2] != path[i - 1][2]]
+                switches = [
+                    (path[i][0], path[i][1])
+                    for i in range(1, len(path))
+                    if path[i][2] != path[i - 1][2]
+                ]
                 return path, switches
 
             for dx, dy in DIRECTIONS_8:
                 nx, ny = cx + dx, cy + dy
                 if not grid.is_free(cl, nx, ny, net_id):
                     continue
+
                 move_cost = 1.414 if (dx != 0 and dy != 0) else 1.0
+
                 parent = came_from.get(current)
                 if parent is not None:
-                    if (cx - parent[0], cy - parent[1]) != (dx, dy):
-                        move_cost += cfg.direction_change_cost * 0.1
+                    pdx, pdy = cx - parent[0], cy - parent[1]
+                    if (pdx, pdy) != (dx, dy):
+                        move_cost += cfg.direction_change_cost * 0.15
+
                 new_g = g + move_cost
                 neighbor = (nx, ny, cl)
+
                 if neighbor not in g_score or new_g < g_score[neighbor]:
                     g_score[neighbor] = new_g
                     h = math.hypot(nx - ex, ny - ey)
@@ -250,10 +446,14 @@ class AutoRouter:
 
         return None, []
 
-    def _path_to_trace(self, grid: RoutingGrid, path: list[tuple[int, int, int]],
-                       trace: Trace, width: float, net_id: int) -> None:
+    def _path_to_trace(
+        self, grid: RoutingGrid, path: list[tuple[int, int, int]],
+        trace: Trace, width: float, net_id: int,
+    ) -> None:
+        """Convert a grid path to trace segments and vias."""
         if len(path) < 2:
             return
+
         cfg = self.config
         current_start = path[0]
         current_layer = path[0][2]
@@ -267,8 +467,10 @@ class AutoRouter:
                 if abs(sx - ex) > 0.01 or abs(sy - ey) > 0.01:
                     layer = Layer.F_CU if current_layer == 0 else Layer.B_CU
                     trace.add_segment(Point(sx, sy), Point(ex, ey), width, layer)
+
                 vx, vy = grid.grid_to_mm(prev[0], prev[1])
                 trace.add_via(Point(vx, vy), cfg.via_diameter, cfg.via_drill)
+
                 current_start = path[i]
                 current_layer = layer_idx
 
@@ -279,8 +481,10 @@ class AutoRouter:
             trace.add_segment(Point(sx, sy), Point(ex, ey), width, layer)
 
     def _simplify_segments(self, segments: list[TraceSegment]) -> list[TraceSegment]:
+        """Merge colinear adjacent segments."""
         if len(segments) <= 1:
             return segments
+
         result = [segments[0]]
         for seg in segments[1:]:
             prev = result[-1]
@@ -291,14 +495,18 @@ class AutoRouter:
                 dy1 = prev.end.y - prev.start.y
                 dx2 = seg.end.x - seg.start.x
                 dy2 = seg.end.y - seg.start.y
-                if abs(dx1 * dy2 - dy1 * dx2) < 0.01:
-                    result[-1] = TraceSegment(prev.start, seg.end, prev.width, prev.layer, prev.net_id)
+                cross = abs(dx1 * dy2 - dy1 * dx2)
+                if cross < 0.01:
+                    result[-1] = TraceSegment(
+                        prev.start, seg.end, prev.width, prev.layer, prev.net_id
+                    )
                     continue
             result.append(seg)
         return result
 
     def _mark_board_boundary(self, grid: RoutingGrid) -> None:
-        edge = max(1, int(math.ceil(0.3 / grid.resolution)))
+        """Mark board edges as obstacles."""
+        edge = max(1, int(math.ceil(0.5 / grid.resolution)))
         for li in range(2):
             for x in range(grid.cols):
                 for d in range(edge):
@@ -314,6 +522,7 @@ class AutoRouter:
                         grid.grid[li, y, grid.cols - 1 - d] = 1
 
     def _mark_all_pads(self, grid: RoutingGrid, board: Board) -> None:
+        """Mark all pads on the grid."""
         cfg = self.config
         for comp in board.components:
             for pad in comp.footprint.pads:
@@ -335,9 +544,10 @@ class AutoRouter:
                         else:
                             grid.mark_obstacle(li, gx, gy, radius_cells)
 
-    def _get_pad_positions(self, grid: RoutingGrid, board: Board,
-                           net: Net) -> list[tuple[int, int, int]]:
-        """Get grid positions using the SHARED grid."""
+    def _get_pad_positions(
+        self, grid: RoutingGrid, board: Board, net: Net,
+    ) -> list[tuple[int, int, int]]:
+        """Get grid positions for all pads in a net."""
         positions = []
         seen = set()
         for comp_ref, pad_num in net.pad_refs:
@@ -357,16 +567,43 @@ class AutoRouter:
         return positions
 
     def _order_nets(self, board: Board) -> list[Net]:
-        def sort_key(net: Net) -> tuple[int, int]:
-            p = 2 if net.is_ground else (1 if net.is_power else 0)
-            return (p, len(net.pad_refs))
+        """Order nets: short signal nets first, then power, then GND."""
+        def sort_key(net: Net) -> tuple[int, int, float]:
+            if net.is_ground:
+                priority = 2
+            elif net.is_power:
+                priority = 1
+            else:
+                priority = 0
+
+            pad_count = len(net.pad_refs)
+
+            wire_len = 0.0
+            if pad_count >= 2:
+                positions = []
+                for comp_ref, pad_num in net.pad_refs:
+                    comp = board.get_component(comp_ref)
+                    if comp:
+                        pos = comp.get_pad_absolute_position(pad_num)
+                        if pos:
+                            positions.append(pos)
+                if len(positions) >= 2:
+                    for i in range(len(positions) - 1):
+                        wire_len += positions[i].distance_to(positions[i + 1])
+
+            return (priority, pad_count, wire_len)
+
         return sorted(board.nets, key=sort_key)
 
-    def _emit_step(self, net_name: str, net_id: int, phase: str,
-                   path: list[tuple[float, float]] | None = None,
-                   message: str = "") -> None:
-        step = RouteStep(net_name=net_name, net_id=net_id, phase=phase,
-                         path=path or [], message=message)
+    def _emit_step(
+        self, net_name: str, net_id: int, phase: str,
+        path: list[tuple[float, float]] | None = None,
+        message: str = "",
+    ) -> None:
+        step = RouteStep(
+            net_name=net_name, net_id=net_id, phase=phase,
+            path=path or [], message=message,
+        )
         self._steps.append(step)
         if self._on_step:
             self._on_step(step)

@@ -136,8 +136,9 @@ class Board:
         ]
 
     def clear_routing(self) -> None:
-        """Remove all traces and vias."""
+        """Remove all traces, vias, and copper zones."""
         self.traces.clear()
+        self.zones.clear()
 
     def summary(self) -> dict:
         """Board summary statistics."""

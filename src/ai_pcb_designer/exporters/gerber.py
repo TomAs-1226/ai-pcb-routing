@@ -163,6 +163,19 @@ class GerberExporter:
                 f"X{self._coord(via.position.x)}Y{self._coord(via.position.y)}D03*"
             )
 
+        # Copper zones on this layer
+        for zone in board.zones:
+            if zone.layer != layer:
+                continue
+            if zone.outline and len(zone.outline) >= 3:
+                lines.append("G36*")
+                first = zone.outline[0]
+                lines.append(f"X{self._coord(first.x)}Y{self._coord(first.y)}D02*")
+                for pt in zone.outline[1:]:
+                    lines.append(f"X{self._coord(pt.x)}Y{self._coord(pt.y)}D01*")
+                lines.append(f"X{self._coord(first.x)}Y{self._coord(first.y)}D01*")
+                lines.append("G37*")
+
         lines.append("M02*")
         path.write_text("\n".join(lines))
 

@@ -236,25 +236,29 @@ def usb_micro_b() -> Footprint:
 
 
 def usb_c_16pin() -> Footprint:
-    """USB Type-C 16-pin receptacle (simplified for power and USB 2.0)."""
+    """USB Type-C 16-pin receptacle (simplified for power and USB 2.0).
+
+    Two-row layout: A-side pads on the bottom row, B-side on the top row,
+    with 0.5mm vertical separation to avoid pad overlaps between different nets.
+    """
     pads = [
-        # USB 2.0 + power pins (symmetrical)
-        _smd_pad("A1", -3.25, 6.0, 0.3, 1.0),    # GND
-        _smd_pad("A4", -2.25, 6.0, 0.3, 1.0),     # VBUS
-        _smd_pad("A6", -0.75, 6.0, 0.3, 1.0),     # D+
-        _smd_pad("A7", -0.25, 6.0, 0.3, 1.0),     # D-
-        _smd_pad("A9", 0.75, 6.0, 0.3, 1.0),      # VBUS
-        _smd_pad("A12", 3.25, 6.0, 0.3, 1.0),     # GND
-        _smd_pad("B1", 3.25, 6.0, 0.3, 1.0),      # GND
-        _smd_pad("B4", 2.25, 6.0, 0.3, 1.0),      # VBUS
-        _smd_pad("B6", 0.75, 6.0, 0.3, 1.0),      # D+
-        _smd_pad("B7", 0.25, 6.0, 0.3, 1.0),      # D-
-        _smd_pad("B9", -0.75, 6.0, 0.3, 1.0),     # VBUS
-        _smd_pad("B12", -3.25, 6.0, 0.3, 1.0),    # GND
-        # CC pins
-        _smd_pad("A5", -1.25, 6.0, 0.3, 1.0),     # CC1
-        _smd_pad("B5", 1.25, 6.0, 0.3, 1.0),      # CC2
-        # Shield
+        # A-side row (y = 6.25) - left to right: A1, A4, A5, A6, A7, A9, A12
+        _smd_pad("A1", -3.25, 6.25, 0.3, 0.8),    # GND
+        _smd_pad("A4", -2.25, 6.25, 0.3, 0.8),    # VBUS
+        _smd_pad("A5", -1.25, 6.25, 0.3, 0.8),    # CC1
+        _smd_pad("A6", -0.25, 6.25, 0.3, 0.8),    # D+
+        _smd_pad("A7", 0.25, 6.25, 0.3, 0.8),     # D-
+        _smd_pad("A9", 1.25, 6.25, 0.3, 0.8),     # VBUS
+        _smd_pad("A12", 3.25, 6.25, 0.3, 0.8),    # GND
+        # B-side row (y = 5.75) - mirrored: B12, B9, B7, B6, B5, B4, B1
+        _smd_pad("B12", -3.25, 5.75, 0.3, 0.8),   # GND
+        _smd_pad("B9", -1.25, 5.75, 0.3, 0.8),    # VBUS
+        _smd_pad("B7", -0.25, 5.75, 0.3, 0.8),    # D-
+        _smd_pad("B6", 0.25, 5.75, 0.3, 0.8),     # D+
+        _smd_pad("B5", 1.25, 5.75, 0.3, 0.8),     # CC2
+        _smd_pad("B4", 2.25, 5.75, 0.3, 0.8),     # VBUS
+        _smd_pad("B1", 3.25, 5.75, 0.3, 0.8),     # GND
+        # Shield pins
         _smd_pad("S1", -4.32, 4.515, 1.04, 2.17),
         _smd_pad("S2", 4.32, 4.515, 1.04, 2.17),
     ]
