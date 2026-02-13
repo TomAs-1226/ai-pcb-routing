@@ -1,4 +1,9 @@
-"""Real-time PCB board renderer using Qt QGraphicsView.
+"""Real-time PCB board renderer using Qt QGraphicsView - Phase 2.
+
+Fixes from Phase 1:
+- Throttled rendering: max one full rebuild per 200ms
+- Layer visibility via item groups (no scene rebuild on toggle)
+- Better visual quality with proper layer Z-ordering
 
 Renders all PCB layers with accurate colors:
 - Copper traces and pads
@@ -14,9 +19,10 @@ Supports pan, zoom, and layer visibility toggling.
 from __future__ import annotations
 
 import math
+import time
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QRectF, QPointF, QLineF
+from PySide6.QtCore import Qt, QRectF, QPointF, QLineF, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -30,6 +36,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
+    QGraphicsItemGroup,
     QGraphicsLineItem,
     QGraphicsPathItem,
     QGraphicsRectItem,
@@ -68,6 +75,9 @@ COLORS = {
 # Scale factor: 1mm = N pixels in the scene
 MM_TO_PX = 10.0
 
+# Minimum interval between full scene rebuilds (ms)
+MIN_RENDER_INTERVAL_MS = 200
+
 
 class PCBGraphicsView(QGraphicsView):
     """Custom QGraphicsView with pan/zoom for PCB display."""
@@ -90,6 +100,10 @@ class PCBGraphicsView(QGraphicsView):
 
         self._zoom_level = 1.0
         self._board: Board | None = None
+
+        # Layer groups for efficient visibility toggling
+        self._layer_groups: dict[str, QGraphicsItemGroup] = {}
+
         self._layer_visibility: dict[str, bool] = {
             "board": True,
             "f_cu": True,
@@ -104,17 +118,25 @@ class PCBGraphicsView(QGraphicsView):
             "refs": True,
         }
 
+        # Throttle rendering
+        self._last_render_time = 0.0
+        self._pending_board: Board | None = None
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._do_deferred_render)
+
     @property
     def layer_visibility(self) -> dict[str, bool]:
         return self._layer_visibility
 
     def set_layer_visible(self, layer_name: str, visible: bool) -> None:
+        """Toggle layer visibility without rebuilding the scene."""
         self._layer_visibility[layer_name] = visible
-        if self._board:
-            self.render_board(self._board)
+        group = self._layer_groups.get(layer_name)
+        if group is not None:
+            group.setVisible(visible)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        """Zoom with mouse wheel."""
         factor = 1.15
         if event.angleDelta().y() > 0:
             self.scale(factor, factor)
@@ -124,45 +146,56 @@ class PCBGraphicsView(QGraphicsView):
             self._zoom_level /= factor
 
     def fit_board(self) -> None:
-        """Fit the entire board in the view."""
         if self._scene.sceneRect().isNull():
             return
         self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         self._zoom_level = 1.0
 
     def render_board(self, board: Board) -> None:
-        """Render the entire board from scratch."""
+        """Render the board, throttled to avoid GUI freezes."""
+        now = time.monotonic() * 1000  # ms
+        elapsed = now - self._last_render_time
+
+        if elapsed >= MIN_RENDER_INTERVAL_MS:
+            # Render immediately
+            self._do_render(board)
+        else:
+            # Defer render
+            self._pending_board = board
+            remaining = int(MIN_RENDER_INTERVAL_MS - elapsed)
+            if not self._render_timer.isActive():
+                self._render_timer.start(remaining)
+
+    def _do_deferred_render(self) -> None:
+        if self._pending_board is not None:
+            self._do_render(self._pending_board)
+            self._pending_board = None
+
+    def _do_render(self, board: Board) -> None:
+        """Actually rebuild the scene."""
         self._board = board
+        self._last_render_time = time.monotonic() * 1000
         self._scene.clear()
+        self._layer_groups.clear()
 
         vis = self._layer_visibility
 
-        if vis.get("grid"):
-            self._draw_grid(board)
+        # Create layer groups
+        for key in self._layer_visibility:
+            group = QGraphicsItemGroup()
+            self._scene.addItem(group)
+            group.setVisible(vis.get(key, True))
+            self._layer_groups[key] = group
 
-        if vis.get("board"):
-            self._draw_board_outline(board)
-
-        if vis.get("courtyard"):
-            self._draw_courtyards(board)
-
-        if vis.get("f_cu") or vis.get("b_cu"):
-            self._draw_traces(board)
-
-        if vis.get("pads"):
-            self._draw_pads(board)
-
-        if vis.get("vias"):
-            self._draw_vias(board)
-
-        if vis.get("f_silk"):
-            self._draw_silkscreen(board)
-
-        if vis.get("ratsnest"):
-            self._draw_ratsnest(board)
-
-        if vis.get("refs"):
-            self._draw_references(board)
+        self._draw_grid(board)
+        self._draw_board_outline(board)
+        self._draw_courtyards(board)
+        self._draw_traces(board)
+        self._draw_pads(board)
+        self._draw_vias(board)
+        self._draw_silkscreen(board)
+        self._draw_ratsnest(board)
+        self._draw_references(board)
 
         # Set scene rect with margin
         margin = 10 * MM_TO_PX
@@ -173,46 +206,49 @@ class PCBGraphicsView(QGraphicsView):
             board.settings.height * MM_TO_PX + 2 * margin,
         )
 
+    def _add_to_group(self, layer_name: str, item: QGraphicsItem) -> None:
+        group = self._layer_groups.get(layer_name)
+        if group is not None:
+            group.addToGroup(item)
+
     def _draw_grid(self, board: Board) -> None:
-        """Draw placement grid."""
         pen = QPen(COLORS["grid"], 0.5)
         grid_mm = board.settings.grid_size
         w = board.settings.width
         h = board.settings.height
 
-        # Don't draw grid if it would be too many lines
         if w / grid_mm > 200 or h / grid_mm > 200:
             grid_mm = max(w, h) / 50
 
         x = 0.0
         while x <= w:
-            self._scene.addLine(
+            item = self._scene.addLine(
                 x * MM_TO_PX, 0, x * MM_TO_PX, h * MM_TO_PX, pen
             )
+            self._add_to_group("grid", item)
             x += grid_mm
 
         y = 0.0
         while y <= h:
-            self._scene.addLine(
+            item = self._scene.addLine(
                 0, y * MM_TO_PX, w * MM_TO_PX, y * MM_TO_PX, pen
             )
+            self._add_to_group("grid", item)
             y += grid_mm
 
     def _draw_board_outline(self, board: Board) -> None:
-        """Draw board edge outline and fill."""
         w = board.settings.width * MM_TO_PX
         h = board.settings.height * MM_TO_PX
 
-        # Board fill
         rect = self._scene.addRect(
             0, 0, w, h,
             QPen(COLORS["board_edge"], 2),
             QBrush(COLORS["board"]),
         )
         rect.setZValue(-100)
+        self._add_to_group("board", rect)
 
     def _draw_pads(self, board: Board) -> None:
-        """Draw all component pads."""
         for comp in board.components:
             for pad in comp.footprint.pads:
                 abs_pos = pad.absolute_position(comp.position, comp.rotation)
@@ -236,6 +272,7 @@ class PCBGraphicsView(QGraphicsView):
                         QBrush(color),
                     )
                 item.setZValue(10)
+                self._add_to_group("pads", item)
 
                 # Draw drill hole for THT pads
                 if pad.drill_size > 0:
@@ -246,13 +283,15 @@ class PCBGraphicsView(QGraphicsView):
                         QBrush(COLORS["drill"]),
                     )
                     drill.setZValue(11)
+                    self._add_to_group("pads", drill)
 
     def _draw_traces(self, board: Board) -> None:
-        """Draw all routed traces."""
         for seg in board.get_all_segments():
             from ..core.datatypes import Layer as L
-            color = COLORS["f_cu"] if seg.layer == L.F_CU else COLORS["b_cu"]
-            z = 5 if seg.layer == L.F_CU else 4
+            is_front = seg.layer == L.F_CU
+            color = COLORS["f_cu"] if is_front else COLORS["b_cu"]
+            z = 5 if is_front else 4
+            layer_key = "f_cu" if is_front else "b_cu"
 
             pen = QPen(color, seg.width * MM_TO_PX)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -263,35 +302,32 @@ class PCBGraphicsView(QGraphicsView):
                 pen,
             )
             line.setZValue(z)
+            self._add_to_group("traces", line)
 
     def _draw_vias(self, board: Board) -> None:
-        """Draw all vias."""
         for via in board.get_all_vias():
             px = via.position.x * MM_TO_PX
             py = via.position.y * MM_TO_PX
             d = via.diameter * MM_TO_PX
             dd = via.drill * MM_TO_PX
 
-            # Via annular ring
             ring = self._scene.addEllipse(
                 px - d / 2, py - d / 2, d, d,
                 QPen(Qt.PenStyle.NoPen),
                 QBrush(COLORS["via"]),
             )
             ring.setZValue(12)
+            self._add_to_group("vias", ring)
 
-            # Via drill
             drill = self._scene.addEllipse(
                 px - dd / 2, py - dd / 2, dd, dd,
                 QPen(Qt.PenStyle.NoPen),
                 QBrush(COLORS["via_drill"]),
             )
             drill.setZValue(13)
+            self._add_to_group("vias", drill)
 
     def _draw_silkscreen(self, board: Board) -> None:
-        """Draw silkscreen markings."""
-        pen = QPen(COLORS["f_silk"], 1.2)
-
         for comp in board.components:
             for silk in comp.footprint.silk_lines:
                 start = silk.start.rotate(comp.rotation) + comp.position
@@ -304,6 +340,7 @@ class PCBGraphicsView(QGraphicsView):
                     silk_pen,
                 )
                 line.setZValue(15)
+                self._add_to_group("f_silk", line)
 
             for circle in comp.footprint.silk_circles:
                 center = circle.center.rotate(comp.rotation) + comp.position
@@ -317,9 +354,9 @@ class PCBGraphicsView(QGraphicsView):
                     QBrush(Qt.BrushStyle.NoBrush),
                 )
                 item.setZValue(15)
+                self._add_to_group("f_silk", item)
 
     def _draw_ratsnest(self, board: Board) -> None:
-        """Draw unrouted net connections as thin lines."""
         pen = QPen(COLORS["ratsnest"], 1)
         pen.setStyle(Qt.PenStyle.DashLine)
 
@@ -331,7 +368,6 @@ class PCBGraphicsView(QGraphicsView):
             if len(net.pad_refs) < 2:
                 continue
 
-            # Draw lines between all pad pairs in unrouted nets
             positions = []
             for comp_ref, pad_num in net.pad_refs:
                 comp = board.get_component(comp_ref)
@@ -349,9 +385,9 @@ class PCBGraphicsView(QGraphicsView):
                     pen,
                 )
                 line.setZValue(1)
+                self._add_to_group("ratsnest", line)
 
     def _draw_references(self, board: Board) -> None:
-        """Draw component reference designators."""
         font = QFont("Monospace", 7)
 
         for comp in board.components:
@@ -362,16 +398,16 @@ class PCBGraphicsView(QGraphicsView):
                 comp.position.y * MM_TO_PX - 15,
             )
             text.setZValue(20)
+            self._add_to_group("refs", text)
 
     def _draw_courtyards(self, board: Board) -> None:
-        """Draw component courtyard areas."""
         for comp in board.components:
             cy = comp.footprint.courtyard
             if cy is None:
                 continue
 
             r = cy.rect
-            self._scene.addRect(
+            item = self._scene.addRect(
                 (comp.position.x + r.x) * MM_TO_PX,
                 (comp.position.y + r.y) * MM_TO_PX,
                 r.width * MM_TO_PX,
@@ -379,3 +415,4 @@ class PCBGraphicsView(QGraphicsView):
                 QPen(COLORS["courtyard"], 1),
                 QBrush(COLORS["courtyard"]),
             )
+            self._add_to_group("courtyard", item)

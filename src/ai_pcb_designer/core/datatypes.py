@@ -11,6 +11,8 @@ from typing import Iterator
 class Layer(Enum):
     """PCB layer identifiers."""
     F_CU = "F.Cu"
+    IN1_CU = "In1.Cu"
+    IN2_CU = "In2.Cu"
     B_CU = "B.Cu"
     F_MASK = "F.Mask"
     B_MASK = "B.Mask"

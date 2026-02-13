@@ -43,9 +43,9 @@ class BoardSettings:
     @property
     def layers(self) -> list[Layer]:
         """Active copper layers based on board configuration."""
-        if self.num_copper_layers == 2:
-            return [Layer.F_CU, Layer.B_CU]
-        return [Layer.F_CU, Layer.B_CU]  # extend for 4-layer later
+        if self.num_copper_layers >= 4:
+            return [Layer.F_CU, Layer.IN1_CU, Layer.IN2_CU, Layer.B_CU]
+        return [Layer.F_CU, Layer.B_CU]
 
 
 @dataclass

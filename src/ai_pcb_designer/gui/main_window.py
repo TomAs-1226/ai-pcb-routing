@@ -1,4 +1,11 @@
-"""Main application window for AI PCB Designer.
+"""Main application window for AI PCB Designer - Phase 2.
+
+Fixes from Phase 1:
+- Stop button actually cancels the agent
+- Board snapshot is deep-copied by agent (no more thread-safety issues)
+- Throttled rendering prevents GUI freezes
+- Board size input with feasibility check
+- 3D viewer dialog shown after design completes
 
 Features:
 - Natural language input for board description
@@ -6,7 +13,8 @@ Features:
 - Step-by-step log panel showing agent decisions
 - Layer visibility controls
 - Template quick-select
-- Output file browser
+- Board size configuration
+- 3D viewer after completion
 """
 
 from __future__ import annotations
@@ -22,7 +30,9 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDockWidget,
+    QDoubleSpinBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -34,6 +44,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QTextEdit,
     QToolBar,
     QVBoxLayout,
@@ -50,6 +61,7 @@ from .renderer import PCBGraphicsView
 class StepSignal(QObject):
     """Signal bridge for cross-thread step updates."""
     step_received = Signal(object)  # AgentStep
+    design_finished = Signal(object)  # Board or None
 
 
 class MainWindow(QMainWindow):
@@ -57,7 +69,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("AI PCB Designer — Autonomous PCB Design Tool")
+        self.setWindowTitle("AI PCB Designer -- Autonomous PCB Design Tool")
         self.setMinimumSize(1200, 800)
         self.resize(1400, 900)
 
@@ -65,6 +77,7 @@ class MainWindow(QMainWindow):
         self._design_thread: threading.Thread | None = None
         self._step_signal = StepSignal()
         self._step_signal.step_received.connect(self._on_agent_step)
+        self._step_signal.design_finished.connect(self._on_design_finished)
 
         self._setup_ui()
         self._setup_menubar()
@@ -74,7 +87,6 @@ class MainWindow(QMainWindow):
     # ─── UI Setup ───────────────────────────────────────────────────────
 
     def _setup_ui(self) -> None:
-        """Build the main UI layout."""
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -84,9 +96,17 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter)
 
-        # Left: PCB Renderer
+        # Left: PCB Renderer in a tab widget (2D + 3D)
+        self._view_tabs = QTabWidget()
         self._renderer = PCBGraphicsView()
-        splitter.addWidget(self._renderer)
+        self._view_tabs.addTab(self._renderer, "2D View")
+
+        # 3D tab placeholder (will be populated after design completes)
+        self._3d_placeholder = QLabel("3D view will appear after design completes")
+        self._3d_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._3d_placeholder.setStyleSheet("QLabel { color: #888; font-size: 14px; }")
+        self._view_tabs.addTab(self._3d_placeholder, "3D View")
+        splitter.addWidget(self._view_tabs)
 
         # Right: Control panels
         right_panel = QWidget()
@@ -101,12 +121,12 @@ class MainWindow(QMainWindow):
         self._input_text.setPlaceholderText(
             "Describe the PCB you want to create...\n\n"
             "Examples:\n"
-            "• Make me a carrier board for an ESP32 with USB-C, "
+            "- Make me a carrier board for an ESP32 with USB-C, "
             "power LED, and GPIO breakout headers\n"
-            "• Create a simple LED blinker circuit\n"
-            "• Design an I2C sensor breakout board"
+            "- Create a simple LED blinker circuit\n"
+            "- Design an I2C sensor breakout board"
         )
-        self._input_text.setMaximumHeight(120)
+        self._input_text.setMaximumHeight(100)
         input_layout.addWidget(self._input_text)
 
         # Template quick-select
@@ -118,6 +138,30 @@ class MainWindow(QMainWindow):
             self._template_combo.addItem(tmpl["name"], tmpl["name"])
         template_row.addWidget(self._template_combo)
         input_layout.addLayout(template_row)
+
+        # Board size row
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Board Size:"))
+
+        self._width_spin = QDoubleSpinBox()
+        self._width_spin.setRange(0, 500)
+        self._width_spin.setValue(0)
+        self._width_spin.setSuffix(" mm")
+        self._width_spin.setSpecialValueText("Auto")
+        self._width_spin.setToolTip("Board width (0 = auto-size)")
+        size_row.addWidget(self._width_spin)
+
+        size_row.addWidget(QLabel("x"))
+
+        self._height_spin = QDoubleSpinBox()
+        self._height_spin.setRange(0, 500)
+        self._height_spin.setValue(0)
+        self._height_spin.setSuffix(" mm")
+        self._height_spin.setSpecialValueText("Auto")
+        self._height_spin.setToolTip("Board height (0 = auto-size)")
+        size_row.addWidget(self._height_spin)
+
+        input_layout.addLayout(size_row)
 
         # API config row
         api_row = QHBoxLayout()
@@ -133,7 +177,7 @@ class MainWindow(QMainWindow):
 
         # Design button
         btn_row = QHBoxLayout()
-        self._design_btn = QPushButton("🔧  Design PCB")
+        self._design_btn = QPushButton("Design PCB")
         self._design_btn.setMinimumHeight(40)
         self._design_btn.setStyleSheet(
             "QPushButton { background-color: #2d8c3c; color: white; "
@@ -147,6 +191,13 @@ class MainWindow(QMainWindow):
         self._stop_btn = QPushButton("Stop")
         self._stop_btn.setEnabled(False)
         self._stop_btn.setMinimumHeight(40)
+        self._stop_btn.setStyleSheet(
+            "QPushButton { background-color: #8c2d2d; color: white; "
+            "font-weight: bold; border-radius: 6px; }"
+            "QPushButton:hover { background-color: #a63a3a; }"
+            "QPushButton:disabled { background-color: #555; color: #999; }"
+        )
+        self._stop_btn.clicked.connect(self._on_stop_clicked)
         btn_row.addWidget(self._stop_btn)
         input_layout.addLayout(btn_row)
 
@@ -214,19 +265,16 @@ class MainWindow(QMainWindow):
     def _setup_menubar(self) -> None:
         menubar = self.menuBar()
 
-        # File menu
         file_menu = menubar.addMenu("File")
         file_menu.addAction("Export Gerbers...", self._export_gerbers)
         file_menu.addAction("Export KiCad...", self._export_kicad)
         file_menu.addSeparator()
         file_menu.addAction("Exit", self.close)
 
-        # View menu
         view_menu = menubar.addMenu("View")
         view_menu.addAction("Fit Board", self._renderer.fit_board)
         view_menu.addAction("Reset View", self._reset_view)
 
-        # Help menu
         help_menu = menubar.addMenu("Help")
         help_menu.addAction("About", self._show_about)
 
@@ -245,7 +293,6 @@ class MainWindow(QMainWindow):
         """Start the autonomous design process."""
         description = self._input_text.toPlainText().strip()
         if not description:
-            # Check if a template is selected
             template_name = self._template_combo.currentData()
             if template_name:
                 description = template_name
@@ -269,6 +316,8 @@ class MainWindow(QMainWindow):
             llm_provider=providers[llm_idx],
             api_key=self._api_key_input.text().strip(),
             output_dir="./output",
+            user_width=self._width_spin.value(),
+            user_height=self._height_spin.value(),
         )
 
         self._agent = PCBDesignAgent(config)
@@ -277,17 +326,24 @@ class MainWindow(QMainWindow):
         )
 
         # Run design in background thread
+        def run_design():
+            board = self._agent.design(description) if self._agent else None
+            self._step_signal.design_finished.emit(board)
+
         self._design_thread = threading.Thread(
-            target=self._run_design,
-            args=(description,),
+            target=run_design,
             daemon=True,
         )
         self._design_thread.start()
 
-    def _run_design(self, description: str) -> None:
-        """Run the design pipeline in a background thread."""
+    def _on_stop_clicked(self) -> None:
+        """Cancel the running design."""
         if self._agent:
-            self._agent.design(description)
+            self._agent.cancel()
+            self._step_log.appendPlainText("[CANCELLED] Design cancelled by user.")
+            self._update_status("Design cancelled.")
+            self._design_btn.setEnabled(True)
+            self._stop_btn.setEnabled(False)
 
     @Slot(object)
     def _on_agent_step(self, step: AgentStep) -> None:
@@ -300,6 +356,7 @@ class MainWindow(QMainWindow):
             AgentPhase.ANALYZING: "[ANALYZE]",
             AgentPhase.SELECTING_COMPONENTS: "[COMPONENTS]",
             AgentPhase.CREATING_SCHEMATIC: "[SCHEMATIC]",
+            AgentPhase.SIZING_BOARD: "[SIZING]",
             AgentPhase.PLACING_COMPONENTS: "[PLACEMENT]",
             AgentPhase.ROUTING_TRACES: "[ROUTING]",
             AgentPhase.RUNNING_DRC: "[DRC]",
@@ -321,7 +378,7 @@ class MainWindow(QMainWindow):
         # Update renderer if board snapshot available
         if step.board_snapshot:
             self._renderer.render_board(step.board_snapshot)
-            if step.phase in (AgentPhase.CREATING_SCHEMATIC, AgentPhase.COMPLETE):
+            if step.phase in (AgentPhase.CREATING_SCHEMATIC, AgentPhase.SIZING_BOARD):
                 QTimer.singleShot(100, self._renderer.fit_board)
 
             # Update board info
@@ -332,10 +389,42 @@ class MainWindow(QMainWindow):
         # Update status
         self._update_status(step.message)
 
-        # Re-enable button when done
-        if step.phase in (AgentPhase.COMPLETE, AgentPhase.FAILED):
-            self._design_btn.setEnabled(True)
-            self._stop_btn.setEnabled(False)
+    @Slot(object)
+    def _on_design_finished(self, board) -> None:
+        """Called when the design thread completes."""
+        self._design_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+
+        if board is not None:
+            self._renderer.render_board(board)
+            QTimer.singleShot(200, self._renderer.fit_board)
+
+            # Show 3D view
+            self._show_3d_view(board)
+
+            # Update board info
+            summary = board.summary()
+            info = "\n".join(f"{k}: {v}" for k, v in summary.items())
+            self._board_info.setText(info)
+
+    def _show_3d_view(self, board) -> None:
+        """Create and show the 3D board view in the tab."""
+        try:
+            from .viewer3d import Board3DWidget
+            viewer = Board3DWidget()
+            viewer.set_board(board)
+
+            # Replace placeholder tab
+            self._view_tabs.removeTab(1)
+            self._view_tabs.insertTab(1, viewer, "3D View")
+        except Exception as e:
+            # If 3D rendering fails (no OpenGL, etc.), show error
+            error_label = QLabel(f"3D view unavailable: {e}")
+            error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            error_label.setStyleSheet("QLabel { color: #f88; font-size: 12px; }")
+            error_label.setWordWrap(True)
+            self._view_tabs.removeTab(1)
+            self._view_tabs.insertTab(1, error_label, "3D View")
 
     def _on_layer_toggled(self, layer_name: str, checked: bool) -> None:
         self._renderer.set_layer_visible(layer_name, checked)
@@ -398,10 +487,16 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About AI PCB Designer",
-            "AI PCB Designer v0.1.0\n\n"
+            "AI PCB Designer v0.2.0\n\n"
             "Autonomous PCB design tool powered by AI.\n"
             "Designed for people with no PCB experience.\n\n"
-            "Phase 1: Simple boards (ESP32 carrier, LED blinker, etc.)\n\n"
+            "Features:\n"
+            "- Force-directed component placement\n"
+            "- A* trace autorouting with 2-layer support\n"
+            "- Auto board sizing with feasibility check\n"
+            "- Real-time 2D renderer\n"
+            "- 3D board viewer\n"
+            "- DRC with auto-fix\n\n"
             "Generates manufacturing-ready output:\n"
             "- Gerber files (RS-274X)\n"
             "- Excellon drill files\n"
