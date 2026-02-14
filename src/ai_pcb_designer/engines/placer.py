@@ -28,13 +28,13 @@ class PlacementConfig:
     """Configuration for the placement engine."""
     grid_snap: float = 0.5
     padding: float = 1.5          # mm, min courtyard-to-courtyard spacing
-    edge_margin: float = 2.5      # mm, margin from board edge
+    edge_margin: float = 1.5      # mm, margin from board edge (was 2.5)
     max_iterations: int = 300
-    attraction_strength: float = 0.08
-    repulsion_strength: float = 5.0
-    boundary_strength: float = 2.0   # strong boundary push
-    damping: float = 0.7
-    convergence_threshold: float = 0.05
+    attraction_strength: float = 0.20   # pull connected comps together (was 0.08)
+    repulsion_strength: float = 10.0    # push overlaps apart harder (was 5.0)
+    boundary_strength: float = 5.0      # enforce board edges (was 2.0)
+    damping: float = 0.65
+    convergence_threshold: float = 0.3  # allow more settling (was 0.05)
     seed: int | None = None
 
 
@@ -51,6 +51,7 @@ def estimate_board_size(board: Board) -> tuple[float, float]:
     """Estimate minimum board size from component courtyards.
 
     Returns (width_mm, height_mm) with routing overhead.
+    Aims for a compact board — hobby PCBs cost less when smaller.
     """
     total_area = 0.0
     max_comp_w = 0.0
@@ -63,28 +64,28 @@ def estimate_board_size(board: Board) -> tuple[float, float]:
         max_comp_w = max(max_comp_w, r.width)
         max_comp_h = max(max_comp_h, r.height)
 
-    # Routing overhead: 2x for 2-layer, 1.6x for 4-layer
+    # Routing overhead: 1.4x for 2-layer (with good autorouter), 1.2x for 4-layer
     layers = board.settings.num_copper_layers
-    routing_mult = 2.0 if layers <= 2 else 1.6
-    packing_coeff = 0.6  # comfortable density for auto-placement
+    routing_mult = 1.4 if layers <= 2 else 1.2
+    packing_coeff = 0.50  # achievable with force-directed placement
 
     needed_area = total_area * routing_mult / packing_coeff
-    # Add mounting hole area
+    # Mounting holes need ~10 mm² each (M3 pad + keepout)
     mounting_holes = sum(1 for c in board.components if c.reference.startswith("H"))
-    needed_area += mounting_holes * 50.0
+    needed_area += mounting_holes * 10.0
 
     # Compute dimensions with ~1.3 aspect ratio
     aspect = 1.3
     height = math.sqrt(needed_area / aspect)
     width = aspect * height
 
-    margin = 2.5
-    width = max(width + 2 * margin, max_comp_w + 10.0)
-    height = max(height + 2 * margin, max_comp_h + 10.0)
+    margin = 1.5
+    width = max(width + 2 * margin, max_comp_w + 5.0)
+    height = max(height + 2 * margin, max_comp_h + 5.0)
 
-    # Round up to 5mm increments
-    width = math.ceil(width / 5.0) * 5.0
-    height = math.ceil(height / 5.0) * 5.0
+    # Round up to 2mm increments (tighter than old 5mm rounding)
+    width = math.ceil(width / 2.0) * 2.0
+    height = math.ceil(height / 2.0) * 2.0
 
     return width, height
 
@@ -189,9 +190,9 @@ class PlacementEngine:
             ref = comp.reference.upper()
 
             if "USB" in val or "USB" in fp:
-                # USB connector at top edge center, with footprint touching edge
+                # USB connector flush against top edge for cable accessibility
                 fp_rect = comp.footprint.bounding_rect()
-                comp.position = Point(bw / 2, margin + fp_rect.height / 2)
+                comp.position = Point(bw / 2, fp_rect.height / 2 + 0.5)
                 comp.rotation = 0.0
             elif ref.startswith("H") and "MOUNT" in val:
                 if corner_idx < len(corners):
@@ -202,14 +203,21 @@ class PlacementEngine:
         self, comps: list[Component], bw: float, bh: float,
         margin: float, rng: random.Random,
     ) -> None:
-        """Place main ICs near the board center."""
+        """Place main ICs near the board center.
+
+        Spacing adapts to available board width so ICs don't bunch up
+        on small boards or spread too far on large ones.
+        """
         cx, cy = bw / 2, bh / 2
+        n = max(len(comps), 1)
+        # Adaptive spacing: use 40% of board width spread across ICs
+        usable = (bw - 2 * margin - 10) * 0.6
+        spacing = min(usable / max(n, 1), 18.0)
 
         for i, comp in enumerate(comps):
-            # Offset from center for multiple ICs
-            offset_x = (i - len(comps) / 2) * 15.0
-            x = max(margin + 10, min(bw - margin - 10, cx + offset_x))
-            y = max(margin + 10, min(bh - margin - 10, cy))
+            offset_x = (i - (n - 1) / 2) * spacing
+            x = max(margin + 5, min(bw - margin - 5, cx + offset_x))
+            y = max(margin + 5, min(bh - margin - 5, cy))
             comp.position = Point(x, y)
 
     def _place_dependent(
@@ -235,9 +243,11 @@ class PlacementEngine:
                     best_target = pos
 
             if best_target:
-                # Place near target with random offset
+                # Place tight to connected IC (decoupling caps need to
+                # be < 3 mm from their IC).  Distribute around the IC
+                # at different angles but at a close, consistent radius.
                 angle = rng.uniform(0, 2 * math.pi)
-                dist = rng.uniform(3.0, 8.0)
+                dist = rng.uniform(2.0, 4.5)
                 x = best_target.x + dist * math.cos(angle)
                 y = best_target.y + dist * math.sin(angle)
             else:

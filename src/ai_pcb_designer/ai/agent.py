@@ -1136,14 +1136,30 @@ board = pcb.build()
     # ─── DRC Fix ─────────────────────────────────────────────────────────
 
     def _attempt_drc_fix(self, board: Board, drc_result: DRCResult) -> None:
-        """Attempt to fix DRC violations with targeted adjustments."""
+        """Attempt to fix DRC violations with targeted adjustments.
+
+        Handles overlaps, edge clearance, courtyard conflicts, and
+        unrouted / partially-routed nets.  When many nets remain
+        unrouted, the router is re-run with progressively lower via
+        cost so it can use both layers more freely.
+        """
         bw = board.settings.width
         bh = board.settings.height
-        margin = board.settings.design_rules.edge_clearance + 1.0
+        margin = board.settings.design_rules.edge_clearance + 1.5
+
+        moved = False  # track whether placement was adjusted
+
+        # Count unrouted / partially routed to decide re-route strategy
+        unrouted_count = sum(
+            1 for v in drc_result.violations
+            if v.violation_type in (
+                DRCViolationType.UNCONNECTED_NET,
+                DRCViolationType.PARTIALLY_ROUTED_NET,
+            )
+        )
 
         for violation in drc_result.violations:
             if violation.violation_type == DRCViolationType.OVERLAP:
-                # Push overlapping components APART from each other
                 refs = violation.component_refs
                 if len(refs) == 2:
                     c1 = board.get_component(refs[0])
@@ -1152,24 +1168,26 @@ board = pcb.build()
                         dx = c1.position.x - c2.position.x
                         dy = c1.position.y - c2.position.y
                         dist = max(math.hypot(dx, dy), 0.1)
-                        # Normalize direction and push apart
-                        push = 1.5
+                        push = min(2.5, max(1.0, dist * 0.4))
                         nx, ny = dx / dist, dy / dist
-                        # Move c1 away from c2
-                        new_x1 = max(margin, min(bw - margin,
-                                     c1.position.x + push * nx))
-                        new_y1 = max(margin, min(bh - margin,
-                                     c1.position.y + push * ny))
-                        c1.position = Point(new_x1, new_y1)
-                        # Move c2 away from c1 (opposite direction)
-                        new_x2 = max(margin, min(bw - margin,
-                                     c2.position.x - push * nx))
-                        new_y2 = max(margin, min(bh - margin,
-                                     c2.position.y - push * ny))
-                        c2.position = Point(new_x2, new_y2)
+                        c1.position = Point(
+                            max(margin, min(bw - margin,
+                                c1.position.x + push * nx)),
+                            max(margin, min(bh - margin,
+                                c1.position.y + push * ny)),
+                        )
+                        c2.position = Point(
+                            max(margin, min(bw - margin,
+                                c2.position.x - push * nx)),
+                            max(margin, min(bh - margin,
+                                c2.position.y - push * ny)),
+                        )
+                        moved = True
 
-            elif violation.violation_type == DRCViolationType.EDGE_CLEARANCE:
-                # Only fix the specific component(s) referenced in the violation
+            elif violation.violation_type in (
+                DRCViolationType.EDGE_CLEARANCE,
+                DRCViolationType.VIA_EDGE_CLEARANCE,
+            ):
                 for ref in violation.component_refs:
                     comp = board.get_component(ref)
                     if comp:
@@ -1178,10 +1196,47 @@ board = pcb.build()
                         new_y = max(margin, min(bh - margin, cp.y))
                         if new_x != cp.x or new_y != cp.y:
                             comp.position = Point(new_x, new_y)
+                            moved = True
 
-        # Re-route after placement changes
+            elif violation.violation_type == DRCViolationType.COURTYARD_CONFLICT:
+                # Push conflicting components apart (same as overlap)
+                refs = violation.component_refs
+                if len(refs) == 2:
+                    c1 = board.get_component(refs[0])
+                    c2 = board.get_component(refs[1])
+                    if c1 and c2:
+                        dx = c1.position.x - c2.position.x
+                        dy = c1.position.y - c2.position.y
+                        dist = max(math.hypot(dx, dy), 0.1)
+                        push = 1.0
+                        nx, ny = dx / dist, dy / dist
+                        c1.position = Point(
+                            max(margin, min(bw - margin,
+                                c1.position.x + push * nx)),
+                            max(margin, min(bh - margin,
+                                c1.position.y + push * ny)),
+                        )
+                        c2.position = Point(
+                            max(margin, min(bw - margin,
+                                c2.position.x - push * nx)),
+                            max(margin, min(bh - margin,
+                                c2.position.y - push * ny)),
+                        )
+                        moved = True
+
+        # Re-route after placement changes.  If many nets are unrouted
+        # lower the via cost progressively so the router can use both
+        # layers more aggressively.
         board.clear_routing()
-        router = AutoRouter(RouterConfig())
+
+        via_cost = 40.0  # default
+        if unrouted_count > 5:
+            via_cost = 20.0  # desperate: allow vias freely
+        elif unrouted_count > 0:
+            via_cost = 30.0  # moderate: ease via restriction
+
+        router_cfg = RouterConfig(via_cost=via_cost)
+        router = AutoRouter(router_cfg)
         router.route(board)
 
     # ─── Output Generation ───────────────────────────────────────────────

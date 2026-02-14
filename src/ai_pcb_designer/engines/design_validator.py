@@ -545,20 +545,21 @@ class DesignValidator:
                 total_comp_area += r.width * r.height
             utilization = total_comp_area / board_area
 
-            if utilization < 0.05:
+            if utilization < 0.12:
                 issues.append(DesignIssue(
                     category="placement",
                     severity="warning",
                     message=(
                         f"Board utilization is very low ({utilization:.1%}); "
-                        f"the board may be oversized"
+                        f"the board is likely oversized"
                     ),
                     suggestion=(
-                        "Consider reducing the board dimensions to save "
-                        "cost and space"
+                        "Reduce the board dimensions to save cost and "
+                        "space — typical hobby PCBs achieve 15-30% "
+                        "utilization"
                     ),
                 ))
-                score -= 5
+                score -= 10
             elif utilization > 0.60:
                 issues.append(DesignIssue(
                     category="placement",

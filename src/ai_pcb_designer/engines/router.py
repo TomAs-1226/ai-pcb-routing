@@ -32,11 +32,11 @@ class RouterConfig:
     via_diameter: float = 0.8         # mm
     via_drill: float = 0.4            # mm
     clearance: float = 0.25           # mm (edge-to-edge copper clearance)
-    via_cost: float = 80.0            # higher = fewer vias
+    via_cost: float = 40.0            # balanced: allows layer switches when needed
     direction_change_cost: float = 1.5
     max_iterations_per_net: int = 150000
     power_trace_width: float = 0.5    # mm
-    max_rip_up_attempts: int = 3      # rip-up-and-retry cycles
+    max_rip_up_attempts: int = 6      # more retries to clear deadlocks
     gnd_pour: bool = True             # use ground pour instead of routing GND
 
 
@@ -234,17 +234,20 @@ class AutoRouter:
             net.is_power or net.is_ground
         ) else cfg.trace_width
 
-        # AI: compute effective via cost based on net characteristics
+        # Effective via cost based on net type.
+        # Power/GND get low cost (they need both layers freely).
+        # Short signal nets get a mild preference to stay on one layer
+        # but NOT so high that they fail to route.
         if net.is_power or net.is_ground:
-            effective_via_cost = cfg.via_cost * 0.5  # power: vias OK
+            effective_via_cost = cfg.via_cost * 0.5
         elif len(pad_positions) == 2:
             gx1, gy1, _ = pad_positions[0]
             gx2, gy2, _ = pad_positions[1]
             est_len = math.hypot(gx2 - gx1, gy2 - gy1) * res
             if est_len < 15:
-                effective_via_cost = cfg.via_cost * 3.0  # short: avoid vias
+                effective_via_cost = cfg.via_cost * 1.5  # mild preference
             else:
-                effective_via_cost = cfg.via_cost * 1.5
+                effective_via_cost = cfg.via_cost * 1.2
         else:
             effective_via_cost = cfg.via_cost
 
@@ -343,12 +346,15 @@ class AutoRouter:
         if len(pad_positions) < 2:
             return False
 
-        # Find which routed nets might be blocking us
+        # Find which routed nets might be blocking us.
+        # Search a generous radius around each pad so we catch blockers
+        # even on larger boards.
         blocking_net_ids: set[int] = set()
+        search_r = 20  # grid cells (~10 mm at 0.5 mm resolution)
         for pos in pad_positions:
             gx, gy, li = pos
-            for dx in range(-10, 11):
-                for dy in range(-10, 11):
+            for dx in range(-search_r, search_r + 1):
+                for dy in range(-search_r, search_r + 1):
                     nx, ny = gx + dx, gy + dy
                     if 0 <= nx < grid.cols and 0 <= ny < grid.rows:
                         val = grid.grid[li, ny, nx]
@@ -364,7 +370,8 @@ class AutoRouter:
             (cfg.trace_width / 2 + cfg.clearance) / cfg.grid_resolution
         )))
 
-        for bid in list(blocking_net_ids)[:2]:
+        # Try ripping up to 4 blocking nets instead of just 2
+        for bid in list(blocking_net_ids)[:4]:
             if bid not in routed_traces:
                 continue
 
@@ -639,14 +646,20 @@ class AutoRouter:
         return positions
 
     def _order_nets(self, board: Board) -> list[Net]:
-        """Order nets: short signal nets first, then power, then GND."""
+        """Order nets: GND first, then power, then short signals last.
+
+        On a 2-layer board the most constrained nets (GND / power)
+        should be routed first so they get the best paths.  Short signal
+        nets are the most flexible — they can dodge around existing
+        traces — so they go last.
+        """
         def sort_key(net: Net) -> tuple[int, int, float]:
             if net.is_ground:
-                priority = 2
+                priority = 0  # GND first (most connections, needs good paths)
             elif net.is_power:
-                priority = 1
+                priority = 1  # power next
             else:
-                priority = 0
+                priority = 2  # signal last
 
             pad_count = len(net.pad_refs)
 

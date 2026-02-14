@@ -758,36 +758,39 @@ class DesignEngine:
     # ── Board Size Estimation ────────────────────────────────────────────
 
     def _estimate_board_size(self, request: DesignRequest) -> tuple[float, float]:
-        """Compute board dimensions based on requested features."""
+        """Compute board dimensions based on requested features.
+
+        Aims for compact boards — smaller = cheaper to fabricate.
+        """
         if request.led_matrix:
             cols, rows = request.led_matrix
-            width = max(70, cols * 10 + 20)
-            height = max(55, 50 + rows * 10 + 15)
+            width = max(50, cols * 10 + 10)
+            height = max(40, 35 + rows * 10 + 10)
             self._log.append(
                 f"Board sized for {cols}x{rows} LED matrix: "
                 f"{width}x{height}mm"
             )
             return width, height
 
-        # Base size
-        width = 70.0
-        height = 55.0
+        # Start with a compact base that fits most simple projects
+        width = 50.0
+        height = 40.0
 
-        # Grow for features
+        # Grow only for features that genuinely need more room
         if request.camera:
-            width = max(width, 80)
-            height = max(height, 65)
+            width = max(width, 60)
+            height = max(height, 50)
         if request.display:
-            height += 15
+            height += 10
         if request.sd_card:
-            width = max(width, 80)
+            width = max(width, 60)
         if request.motor_driver:
-            width = max(width, 85)
-            height = max(height, 65)
+            width = max(width, 65)
+            height = max(height, 50)
         if request.neopixel_strip > 0:
-            width = max(width, request.neopixel_strip * 10 + 20)
+            width = max(width, request.neopixel_strip * 8 + 10)
         if request.screw_terminals > 0:
-            width = max(width, request.screw_terminals * 8 + 40)
+            width = max(width, request.screw_terminals * 6 + 20)
 
         self._log.append(f"Board size: {width:.0f}x{height:.0f}mm")
         return width, height
