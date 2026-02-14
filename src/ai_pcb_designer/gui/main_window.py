@@ -848,7 +848,13 @@ class MainWindow(QMainWindow):
     # ─── Event Handlers ──────────────────────────────────────────────────
 
     def _on_design_clicked(self) -> None:
-        """Start the autonomous design process."""
+        """Start the autonomous design process.
+
+        If a board already exists (previous design completed), treat new
+        input as an edit/continuation of the existing board, not a fresh
+        start. This avoids the confusing behaviour of losing the existing
+        design when the user submits a follow-up request.
+        """
         description = self._input_text.toPlainText().strip()
         if not description:
             template_name = self._template_combo.currentData()
@@ -858,6 +864,16 @@ class MainWindow(QMainWindow):
                 self._add_chat_msg("system",
                     "Please enter a description of the PCB you want to create.")
                 return
+
+        # If a board already exists, route to edit instead of starting fresh
+        if (self._agent and self._agent.board
+                and self._agent.phase in (AgentPhase.COMPLETE,
+                                          AgentPhase.FAILED,
+                                          AgentPhase.IDLE)):
+            self._add_chat_msg("user", description)
+            self._input_text.clear()
+            self._on_edit_send(description)
+            return
 
         # Show user message in chat
         self._add_chat_msg("user", description)

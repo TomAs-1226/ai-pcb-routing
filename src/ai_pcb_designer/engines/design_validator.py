@@ -93,12 +93,15 @@ class DesignValidator:
         placement = self._check_placement_quality(board, issues)
         routing = self._check_routing_feasibility(board, issues)
 
+        completeness = self._check_circuit_completeness(board, issues)
+
         total = (
-            feasibility * 0.30
-            + signal * 0.20
+            feasibility * 0.25
+            + signal * 0.15
             + power * 0.20
-            + placement * 0.15
-            + routing * 0.15
+            + placement * 0.10
+            + routing * 0.10
+            + completeness * 0.20
         )
 
         return DesignScore(
@@ -722,5 +725,156 @@ class DesignValidator:
                 ),
             ))
             score -= penalty
+
+        return score
+
+    # ------------------------------------------------------------------
+    # Circuit completeness
+    # ------------------------------------------------------------------
+
+    def _check_circuit_completeness(
+        self, board: Board, issues: list[DesignIssue]
+    ) -> float:
+        """Check that the circuit has all necessary supporting components.
+
+        * Each IC should have at least one bypass cap on its power net.
+        * Regular LEDs should have current-limiting resistors.
+        * Components should not be completely unconnected.
+        * Design should have a minimum component count for viability.
+        """
+        score = 100.0
+
+        # Categorize components by reference prefix
+        ics = [c for c in board.components if c.reference.upper().startswith("U")]
+        caps = [c for c in board.components if c.reference.upper().startswith("C")]
+        resistors = [c for c in board.components if c.reference.upper().startswith("R")]
+        leds = [c for c in board.components
+                if c.reference.upper().startswith("D")
+                and ("LED" in c.value.upper() or "WS2812" in c.value.upper())]
+
+        # --- Each IC should have at least one bypass cap in its nets ---
+        for ic in ics:
+            ic_power_nets: set[str] = set()
+            ic_gnd_nets: set[str] = set()
+            for net in board.nets:
+                for comp_ref, _ in net.pad_refs:
+                    if comp_ref == ic.reference:
+                        if net.is_power:
+                            ic_power_nets.add(net.name)
+                        elif net.is_ground:
+                            ic_gnd_nets.add(net.name)
+
+            cap_on_power = False
+            for net in board.nets:
+                if net.name not in ic_power_nets and net.name not in ic_gnd_nets:
+                    continue
+                for comp_ref, _ in net.pad_refs:
+                    if comp_ref != ic.reference and any(
+                        c.reference == comp_ref for c in caps
+                    ):
+                        cap_on_power = True
+                        break
+                if cap_on_power:
+                    break
+
+            if not cap_on_power and len(caps) > 0:
+                issues.append(DesignIssue(
+                    category="completeness",
+                    severity="warning",
+                    message=(
+                        f"IC {ic.reference} ({ic.value}) has no bypass "
+                        f"capacitor sharing its power/ground nets"
+                    ),
+                    component_refs=[ic.reference],
+                    location=ic.position,
+                    suggestion=(
+                        f"Add a 100nF bypass cap between power and ground "
+                        f"near {ic.reference}"
+                    ),
+                ))
+                score -= 8
+
+        # --- Regular LEDs should have current-limiting resistors ---
+        for led in leds:
+            if "WS2812" in led.value.upper():
+                continue  # Addressable LEDs have internal current limiting
+
+            led_nets: set[str] = set()
+            for net in board.nets:
+                if net.is_power or net.is_ground:
+                    continue
+                for comp_ref, _ in net.pad_refs:
+                    if comp_ref == led.reference:
+                        led_nets.add(net.name)
+
+            has_resistor = False
+            for net in board.nets:
+                if net.name not in led_nets:
+                    continue
+                for comp_ref, _ in net.pad_refs:
+                    if any(r.reference == comp_ref for r in resistors):
+                        has_resistor = True
+                        break
+                if has_resistor:
+                    break
+
+            if not has_resistor:
+                issues.append(DesignIssue(
+                    category="completeness",
+                    severity="warning",
+                    message=(
+                        f"LED {led.reference} has no current-limiting "
+                        f"resistor in its signal path"
+                    ),
+                    component_refs=[led.reference],
+                    location=led.position,
+                    suggestion=(
+                        f"Add a resistor (330-1k ohm) in series with "
+                        f"{led.reference} to limit current"
+                    ),
+                ))
+                score -= 5
+
+        # --- Check for completely unconnected components ---
+        connected_refs: set[str] = set()
+        for net in board.nets:
+            for comp_ref, _ in net.pad_refs:
+                connected_refs.add(comp_ref)
+
+        for comp in board.components:
+            if comp.reference.upper().startswith("H"):
+                continue
+            if comp.reference not in connected_refs:
+                issues.append(DesignIssue(
+                    category="completeness",
+                    severity="warning",
+                    message=(
+                        f"Component {comp.reference} ({comp.value}) is "
+                        f"not connected to any net"
+                    ),
+                    component_refs=[comp.reference],
+                    location=comp.position,
+                    suggestion=(
+                        f"Connect {comp.reference} to the appropriate nets "
+                        f"or remove it if not needed"
+                    ),
+                ))
+                score -= 5
+
+        # --- Minimum component count check ---
+        if len(board.components) < 3:
+            issues.append(DesignIssue(
+                category="completeness",
+                severity="warning",
+                message=(
+                    f"Design has only {len(board.components)} components; "
+                    f"this seems incomplete"
+                ),
+                suggestion=(
+                    "A typical MCU board needs at minimum: MCU, power "
+                    "regulator, bypass caps, connectors"
+                ),
+            ))
+            score -= 20
 
         return score

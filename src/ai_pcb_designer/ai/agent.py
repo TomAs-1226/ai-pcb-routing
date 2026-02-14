@@ -250,6 +250,7 @@ class PCBDesignAgent:
             # Define task list (visible to user)
             task_names = [
                 "Analyze request",
+                "Propose components",
                 "Design circuit",
                 "Validate physics & rules",
                 "Place components",
@@ -280,6 +281,28 @@ class PCBDesignAgent:
                 self._chat("system", f"Incorporated user feedback: {user_msgs}")
 
             self._update_task("Analyze request", "done")
+
+            # ── Task 1.5: Propose components ─────────────────────
+            self._update_task("Propose components", "running")
+            component_proposal = self._propose_components(user_request)
+            if component_proposal:
+                self._chat("agent",
+                    "Proposed Bill of Materials:",
+                    detail=component_proposal)
+                # Give user a moment to review / intervene
+                import time as _time
+                _time.sleep(0.5)
+                user_msgs = self._get_user_messages()
+                if user_msgs:
+                    for msg in user_msgs:
+                        self._chat("user", msg)
+                        user_request += f"\n\nUser component feedback: {msg}"
+                        self._memory.add_note("STRATEGY",
+                            f"User feedback on components: {msg}", priority=3)
+            self._update_task("Propose components", "done")
+
+            if self._is_cancelled():
+                return None
 
             # ── Task 2: Design (agentic loop) ────────────────────
             self._update_task("Design circuit", "running")
@@ -717,15 +740,16 @@ class PCBDesignAgent:
     # ─── Helpers ─────────────────────────────────────────────────────────
 
     def edit(self, edit_request: str) -> Board | None:
-        """Apply an incremental edit to the current board via LLM.
+        """Apply an incremental edit to the current board.
 
         This powers the chat-based editing flow: after the initial design
         is complete, the user can send follow-up requests like "move U1
         to the left", "add a second LED", "remove the debug header", etc.
 
-        The LLM receives the current board state (components, nets,
-        board size) and generates modification code that operates on the
-        existing PCBDesign.
+        When an LLM provider is configured, the LLM receives the current
+        board state and generates modification code. When using template
+        mode, the request is combined with the original description and
+        re-run through the DesignEngine.
 
         Returns the updated board on success, or the original board on
         failure.
@@ -734,15 +758,8 @@ class PCBDesignAgent:
             self._emit(AgentPhase.FAILED, "No board to edit -- design one first.")
             return None
 
-        if self.config.llm_provider in ("template", ""):
-            self._emit(
-                AgentPhase.ANALYZING,
-                "Edit requires an LLM provider (OpenAI or Anthropic). "
-                "Select one in the LLM dropdown.",
-            )
-            return self._board
-
         self._cancel_event.clear()
+        self._chat("agent", f"Editing board: {edit_request}")
         self._emit(
             AgentPhase.ANALYZING,
             f"Editing board: {edit_request}",
@@ -750,15 +767,39 @@ class PCBDesignAgent:
         )
 
         try:
-            board = self._apply_edit_via_llm(edit_request)
+            board = None
+
+            if self.config.llm_provider in ("template", ""):
+                # No LLM available - rebuild via DesignEngine with combined request
+                self._chat("agent",
+                    "Re-designing with your changes (no LLM configured)...")
+                combined = self._build_combined_description(edit_request)
+                try:
+                    engine = DesignEngine()
+                    request_parsed = parse_request(combined)
+                    pcb = engine.create_design(request_parsed)
+                    board = pcb.build()
+                    self._chat("agent",
+                        f"Rebuilt design with {len(board.components)} components",
+                        detail="\n".join(engine.design_log[-5:]))
+                except Exception as e:
+                    self._chat("agent", f"Rebuild failed: {e}")
+                    board = None
+            else:
+                board = self._apply_edit_via_llm(edit_request)
+
             if board is None:
+                self._chat("agent", "Edit failed -- keeping original board.")
                 self._emit(
-                    AgentPhase.ANALYZING,
+                    AgentPhase.COMPLETE,
                     "Edit failed -- keeping original board.",
+                    progress=1.0,
+                    board=self._board,
                 )
                 return self._board
 
             # Re-place, re-route, re-DRC
+            self._chat("task", "Placing components...", task_status="running")
             self._emit(
                 AgentPhase.PLACING_COMPONENTS,
                 "Re-placing components after edit...",
@@ -767,6 +808,7 @@ class PCBDesignAgent:
             placer = PlacementEngine(PlacementConfig(seed=42))
             placer.place(board)
 
+            self._chat("task", "Routing traces...", task_status="running")
             self._emit(
                 AgentPhase.ROUTING_TRACES,
                 "Re-routing traces...",
@@ -798,6 +840,9 @@ class PCBDesignAgent:
                 router2.route(board)
 
             self._board = board
+            self._chat("agent", "Edit applied successfully!",
+                       detail=f"{len(board.components)} components, "
+                              f"{len(board.nets)} nets")
             self._emit(
                 AgentPhase.COMPLETE,
                 "Edit applied successfully!",
@@ -807,8 +852,54 @@ class PCBDesignAgent:
             return board
 
         except Exception as e:
+            self._chat("agent", f"Edit failed: {e}")
             self._emit(AgentPhase.FAILED, f"Edit failed: {e}")
             return self._board
+
+    def _build_combined_description(self, edit_request: str) -> str:
+        """Build a combined description from existing board + edit request.
+
+        Used when re-running through DesignEngine (no LLM available).
+        Extracts the current board's features and merges with the edit.
+        """
+        board = self._board
+        if board is None:
+            return edit_request
+
+        # Describe what the current board has
+        existing_parts = []
+        for comp in board.components:
+            ref = comp.reference.upper()
+            val = comp.value
+            if "ESP32" in val.upper():
+                existing_parts.append("ESP32 microcontroller")
+            elif "USB" in val.upper():
+                existing_parts.append(f"USB connector ({val})")
+            elif ref.startswith("R"):
+                existing_parts.append(f"resistor {val}")
+            elif ref.startswith("C"):
+                existing_parts.append(f"capacitor {val}")
+            elif ref.startswith("D") and "LED" in val.upper():
+                existing_parts.append(f"LED ({val})")
+            elif ref.startswith("J"):
+                existing_parts.append(f"connector ({val})")
+            elif ref.startswith("SW"):
+                existing_parts.append("push button")
+
+        # Deduplicate but keep counts
+        from collections import Counter
+        counts = Counter(existing_parts)
+        parts_summary = ", ".join(
+            f"{v}x {k}" if v > 1 else k
+            for k, v in counts.items()
+        )
+
+        combined = (
+            f"ESP32 board with the following existing components: "
+            f"{parts_summary}. "
+            f"Additional requirements: {edit_request}"
+        )
+        return combined
 
     def _apply_edit_via_llm(self, edit_request: str) -> Board | None:
         """Send the current board state + edit request to the LLM."""
@@ -1004,6 +1095,101 @@ class PCBDesignAgent:
         return best_match if best_score >= 1 else None
 
     # ─── Custom Design via DesignEngine ─────────────────────────────────
+
+    def _propose_components(self, user_request: str) -> str:
+        """Propose a component list before starting the design.
+
+        For LLM-based designs, asks the AI to think about which
+        components are needed and why. For template/engine designs,
+        uses the DesignEngine's parse_request to infer components.
+
+        Returns a formatted string describing the proposed BOM, or
+        empty string if proposal not available.
+        """
+        # For template mode, use the parser to infer components
+        if self.config.llm_provider in ("template", ""):
+            try:
+                request_parsed = parse_request(user_request)
+                lines = []
+                lines.append("MCU: ESP32-WROOM-32" if not request_parsed.stm32
+                             else "MCU: STM32F103 (QFP-48)")
+                lines.append("Power: USB-C connector + AMS1117-3.3 LDO")
+
+                if request_parsed.sensors:
+                    for s in request_parsed.sensors:
+                        iface = DesignEngine._SENSOR_INTERFACE.get(s, "i2c")
+                        lines.append(f"Sensor: {s.upper()} ({iface})")
+                if request_parsed.relay:
+                    lines.append(
+                        f"Relays: {request_parsed.relay_count}x SPDT "
+                        f"+ NPN drivers + flyback diodes")
+                if request_parsed.display:
+                    lines.append(f"Display: {request_parsed.display} connector")
+                if request_parsed.leds > 0:
+                    lines.append(f"LEDs: {request_parsed.leds}x indicator LEDs")
+                if request_parsed.motor_driver:
+                    lines.append(
+                        f"Motors: {request_parsed.motor_count}x motor drivers")
+                if request_parsed.camera:
+                    lines.append("Camera: FPC connector for OV2640/OV5640")
+                if request_parsed.sd_card:
+                    lines.append("Storage: MicroSD socket")
+                if request_parsed.barrel_jack:
+                    lines.append("Power: Barrel jack + protection diode")
+                if request_parsed.buttons > 0:
+                    lines.append(f"Buttons: {request_parsed.buttons}x tactile switches")
+                if request_parsed.neopixel_strip > 0:
+                    lines.append(
+                        f"NeoPixels: {request_parsed.neopixel_strip}x WS2812B")
+
+                lines.append("")
+                lines.append(
+                    "Supporting components: bypass caps, pull-up resistors, "
+                    "current-limiting resistors as needed")
+                lines.append("Board: 2-layer FR4, auto-sized to fit all components")
+                return "\n".join(lines)
+            except Exception:
+                return ""
+
+        # For LLM mode, ask the AI to propose components
+        try:
+            api_key = self.config.api_key
+            provider = self.config.llm_provider
+
+            proposal_prompt = (
+                "You are a PCB design engineer. The user wants to build:\n\n"
+                f"{user_request}\n\n"
+                "List ALL the components needed for this design. For each:\n"
+                "- Component name and package (e.g., ESP32-WROOM-32, AMS1117-3.3 SOT-223)\n"
+                "- Purpose (why it's needed)\n"
+                "- Key specs (voltage, current, value)\n\n"
+                "Include all supporting components (bypass caps, pull-ups, "
+                "protection diodes, etc). Think about:\n"
+                "1. Power delivery chain (input → regulation → loads)\n"
+                "2. Signal conditioning (pull-ups, level shifting, filtering)\n"
+                "3. Protection (ESD, reverse polarity, overcurrent)\n"
+                "4. Decoupling (every IC needs bypass caps)\n\n"
+                "Format as a simple list. Be thorough - missing a component "
+                "means the board won't work!\n"
+                "DO NOT generate any code. Just list the components."
+            )
+
+            self._chat("agent", "Analyzing required components...")
+
+            if provider == "openai":
+                result = self._call_openai(
+                    "You are an expert PCB design engineer.",
+                    proposal_prompt, api_key)
+            elif provider == "anthropic":
+                result = self._call_anthropic(
+                    "You are an expert PCB design engineer.",
+                    proposal_prompt, api_key)
+            else:
+                return ""
+
+            return result.strip() if result else ""
+        except Exception:
+            return ""
 
     def _create_custom_design(self, user_request: str,
                               iteration: int = 1) -> Board | None:
@@ -1603,20 +1789,44 @@ board = pcb.build()
                 f"Be more creative with component choices and layout.\n"
             )
 
+        # Include the component proposal if one was generated
+        proposal_section = ""
+        proposal_notes = [
+            n for n in self._memory._notes
+            if n.category == "STRATEGY" and "component" in n.content.lower()
+        ]
+        if proposal_notes:
+            proposal_section = (
+                "\n\n## APPROVED COMPONENT LIST\n"
+                "The following components have been selected for this design. "
+                "Make sure to include ALL of them:\n"
+            )
+            for note in proposal_notes:
+                proposal_section += f"- {note.content}\n"
+
         return (
             f"Design a complete, manufacturable PCB for this request:\n\n"
             f"{request}\n\n"
             f"{notes_section}\n"
             f"{iteration_context}\n"
+            f"{proposal_section}\n"
             f"Think carefully about:\n"
             f"1. What components are needed (MCU, power, sensors, connectors)\n"
             f"2. Proper power distribution (regulators, decoupling) - FOLLOW PHYSICS\n"
-            f"3. Signal connections and pin assignments - VERIFY EACH PIN\n"
+            f"3. Signal connections and pin assignments - VERIFY EACH PIN NUMBER\n"
+            f"   CRITICAL: ESP32-WROOM-32 uses numeric pin numbers 1-39, NOT GPIO names!\n"
+            f"   Pin mapping: IO0=25, IO2=24, IO4=26, IO5=29, IO12=14, IO13=16,\n"
+            f"   IO14=13, IO15=23, IO16=27, IO17=28, IO18=30, IO19=31, IO21=33,\n"
+            f"   IO22=36, IO23=37, IO25=10, IO26=11, IO27=12, IO32=8, IO33=9,\n"
+            f"   IO34=6, IO35=7, EN=3, 3V3=2, GND=1/15/39, TXD0=35, RXD0=34\n"
             f"4. Physical layout and component spacing (min 2mm between components)\n"
             f"5. Board size that fits everything with routing room\n"
             f"6. Current calculations for LEDs, motors, relays\n"
             f"7. Voltage levels and level-shifting where needed\n"
             f"8. EMI/EMC: bypass caps, ground planes, short return paths\n\n"
+            f"IMPORTANT: Do NOT miss any components. Every IC needs bypass caps.\n"
+            f"Every LED needs a current-limiting resistor. Every relay needs a\n"
+            f"transistor driver and flyback diode. Every I2C bus needs pull-ups.\n\n"
             f"You may use ANY component from the dynamic discovery library.\n"
             f"If you know the right part, use it! Don't limit yourself to the\n"
             f"built-in components.\n\n"
@@ -1704,7 +1914,7 @@ board = pcb.build()
                 response = client.chat.completions.create(
                     model=model,
                     messages=[{"role": "user", "content": combined}],
-                    max_completion_tokens=16384,
+                    max_completion_tokens=25000,
                 )
             else:
                 response = client.chat.completions.create(
@@ -1714,7 +1924,7 @@ board = pcb.build()
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=0.3,
-                    max_tokens=8192,
+                    max_tokens=12000,
                 )
 
             content = response.choices[0].message.content

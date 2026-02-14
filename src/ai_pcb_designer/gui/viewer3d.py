@@ -6,6 +6,7 @@ Renders a pseudo-3D isometric view of the PCB board showing:
 - Pads on the surface
 - Traces on copper layers
 - Vias as cylinders
+- Silk outlines on components
 
 Uses QPainter-based software rendering for maximum compatibility
 (works without OpenGL/GPU). Supports mouse rotation and zoom.
@@ -57,10 +58,104 @@ PAD_COLOR = QColor(200, 170, 80)           # Gold pads
 VIA_COLOR = QColor(180, 180, 0)            # Yellow vias
 TRACE_F_COLOR = QColor(200, 50, 50, 160)   # Red traces (front)
 TRACE_B_COLOR = QColor(50, 50, 200, 160)   # Blue traces (back)
-COMP_BODY_COLOR = QColor(30, 30, 30)       # Dark gray IC body
-COMP_BODY_PASSIVE = QColor(40, 30, 20)     # Brown passive body
 SILK_COLOR = QColor(255, 255, 255, 200)    # White silk
 BG_COLOR = QColor(25, 25, 35)              # Dark background
+
+# Component body colors by type
+_COMP_COLORS = {
+    "ic":        QColor(30, 30, 30),       # Dark gray IC body
+    "passive":   QColor(40, 30, 20),       # Brown passive body
+    "connector": QColor(60, 60, 60),       # Medium gray connector
+    "switch":    QColor(50, 50, 50),       # Dark switch
+    "header":    QColor(30, 30, 30),       # Black header
+    "led":       QColor(200, 200, 180),    # Light yellow LED
+    "relay":     QColor(30, 30, 100),      # Blue relay
+    "crystal":   QColor(180, 180, 180),    # Silver crystal
+    "default":   QColor(40, 30, 20),       # Brown default
+}
+
+
+def _classify_component(ref: str, value: str) -> tuple[float, QColor]:
+    """Determine component height and body color from reference/value.
+
+    Returns (height_mm, body_color).
+    """
+    ref_up = ref.upper()
+    val_up = value.upper()
+
+    # Mounting holes - skip
+    if ref_up.startswith("H"):
+        return 0.0, _COMP_COLORS["default"]
+
+    # ICs and modules
+    if ref_up.startswith("U"):
+        if "ESP32" in val_up:
+            return 3.0, QColor(50, 50, 50)   # Taller module with shielding
+        if "LDO" in val_up or "AMS1117" in val_up or "REG" in val_up:
+            return 1.8, QColor(30, 30, 30)
+        if "STM32" in val_up or "ATMEGA" in val_up or "PIC" in val_up:
+            return 1.5, QColor(30, 30, 30)
+        if "OLED" in val_up or "SSD1306" in val_up:
+            return 2.0, QColor(20, 20, 40)   # Dark blue OLED module
+        return 2.5, _COMP_COLORS["ic"]
+
+    # Resistors
+    if ref_up.startswith("R"):
+        return 0.6, QColor(40, 30, 20)
+
+    # Capacitors
+    if ref_up.startswith("C"):
+        if "100U" in val_up or "22U" in val_up or "47U" in val_up:
+            return 1.2, QColor(140, 100, 40)  # Taller electrolytic
+        return 0.6, QColor(120, 90, 50)  # Beige ceramic cap
+
+    # LEDs
+    if ref_up.startswith("D"):
+        if "WS2812" in val_up or "NEOPIXEL" in val_up:
+            return 1.5, QColor(255, 255, 240)  # White addressable LED
+        if "1N" in val_up or "SCHOTTKY" in val_up:
+            return 0.8, QColor(40, 40, 40)   # Black diode
+        # Regular LED - slightly translucent look
+        return 0.8, QColor(200, 30, 30)  # Red LED default
+
+    # Connectors (USB, headers, jacks)
+    if ref_up.startswith("J"):
+        if "USB" in val_up:
+            return 3.5, QColor(180, 180, 180)  # Silver USB
+        if "BARREL" in val_up or "JACK" in val_up:
+            return 5.0, QColor(30, 30, 30)
+        if "MICROSD" in val_up or "SD" in val_up:
+            return 2.0, QColor(180, 180, 180)
+        if "FPC" in val_up or "FFC" in val_up:
+            return 1.5, QColor(200, 180, 130)
+        if "SCREW" in val_up or "TERMINAL" in val_up:
+            return 6.0, QColor(0, 100, 0)  # Green terminal block
+        if "SENSOR" in val_up:
+            return 8.0, _COMP_COLORS["header"]
+        # Pin headers
+        return 8.0, _COMP_COLORS["header"]
+
+    # Switches / buttons
+    if ref_up.startswith("SW"):
+        return 3.5, QColor(50, 50, 50)
+
+    # Transistors / MOSFETs
+    if ref_up.startswith("Q"):
+        return 1.2, QColor(30, 30, 30)
+
+    # Relays
+    if ref_up.startswith("K"):
+        return 10.0, _COMP_COLORS["relay"]
+
+    # Inductors
+    if ref_up.startswith("L"):
+        return 1.0, QColor(50, 50, 50)
+
+    # Crystals / oscillators
+    if ref_up.startswith("Y") or "CRYSTAL" in val_up:
+        return 0.8, _COMP_COLORS["crystal"]
+
+    return 1.0, _COMP_COLORS["default"]
 
 
 class Board3DWidget(QWidget):
@@ -141,6 +236,12 @@ class Board3DWidget(QWidget):
         bh = board.settings.height
         thickness = board.settings.design_rules.board_thickness
 
+        # Pre-compute trig values for rotation
+        rz = math.radians(cam.rot_z)
+        rx = math.radians(cam.rot_x)
+        cos_rz, sin_rz = math.cos(rz), math.sin(rz)
+        cos_rx, sin_rx = math.cos(rx), math.sin(rx)
+
         # Project 3D -> 2D using isometric-like projection
         def project(x: float, y: float, z: float) -> tuple[float, float]:
             # Center on board
@@ -148,16 +249,11 @@ class Board3DWidget(QWidget):
             py = y - cam.offset_y
 
             # Rotate around Z axis
-            rz = math.radians(cam.rot_z)
-            rx = math.radians(cam.rot_x)
-
-            x2 = px * math.cos(rz) - py * math.sin(rz)
-            y2 = px * math.sin(rz) + py * math.cos(rz)
-            z2 = z
+            x2 = px * cos_rz - py * sin_rz
+            y2 = px * sin_rz + py * cos_rz
 
             # Tilt (rotate around X)
-            y3 = y2 * math.cos(rx) - z2 * math.sin(rx)
-            z3 = y2 * math.sin(rx) + z2 * math.cos(rx)
+            y3 = y2 * cos_rx - z * sin_rx
 
             # Project to screen
             sx = cx + x2 * cam.zoom
@@ -167,14 +263,21 @@ class Board3DWidget(QWidget):
 
         def depth(x: float, y: float, z: float) -> float:
             """Z-depth for sorting (higher = further from camera)."""
-            rz = math.radians(cam.rot_z)
-            rx = math.radians(cam.rot_x)
             px = x - cam.offset_x
             py = y - cam.offset_y
-            x2 = px * math.cos(rz) - py * math.sin(rz)
-            y2 = px * math.sin(rz) + py * math.cos(rz)
-            z3 = y2 * math.sin(rx) + z * math.cos(rx)
+            y2 = px * sin_rz + py * cos_rz
+            z3 = y2 * sin_rx + z * cos_rx
             return z3
+
+        def rotate_point(px: float, py: float, angle_deg: float,
+                        origin_x: float, origin_y: float) -> tuple[float, float]:
+            """Rotate a point around an origin in 2D (board plane)."""
+            rad = math.radians(angle_deg)
+            cos_a, sin_a = math.cos(rad), math.sin(rad)
+            dx = px - origin_x
+            dy = py - origin_y
+            return (origin_x + dx * cos_a - dy * sin_a,
+                    origin_y + dx * sin_a + dy * cos_a)
 
         # ─── Draw Board Substrate ────────────────────────────────────
 
@@ -280,8 +383,15 @@ class Board3DWidget(QWidget):
                 z = 0.05  # slightly above board surface
                 sx, sy = project(abs_pos.x, abs_pos.y, z)
                 d = depth(abs_pos.x, abs_pos.y, z)
-                pw = max(2, pad.size_x * cam.zoom * 0.4)
-                ph = max(2, pad.size_y * cam.zoom * 0.4)
+
+                # Account for rotation in pad sizing
+                rot_rad = math.radians(comp.rotation)
+                cos_r = abs(math.cos(rot_rad))
+                sin_r = abs(math.sin(rot_rad))
+                pw_raw = pad.size_x * cos_r + pad.size_y * sin_r
+                ph_raw = pad.size_x * sin_r + pad.size_y * cos_r
+                pw = max(2, pw_raw * cam.zoom * 0.4)
+                ph = max(2, ph_raw * cam.zoom * 0.4)
 
                 def draw_pad(p=painter, px=sx, py=sy, ppw=pw, pph=ph,
                             is_smd=pad.is_smd, drill=pad.drill_size):
@@ -298,65 +408,58 @@ class Board3DWidget(QWidget):
 
         # Component bodies
         for comp in board.components:
-            fp_rect = comp.footprint.bounding_rect()
             ref = comp.reference.upper()
 
-            # Determine component height
-            if ref.startswith("U") or "ESP32" in comp.value.upper():
-                comp_h = 2.5  # IC height
-                body_color = COMP_BODY_COLOR
-            elif ref.startswith("H"):
-                continue  # Skip mounting holes for 3D
-            elif ref.startswith(("R", "C", "D")):
-                comp_h = 0.8  # Passive height
-                body_color = COMP_BODY_PASSIVE
-            elif "USB" in comp.value.upper():
-                comp_h = 3.0  # Connector height
-                body_color = QColor(60, 60, 60)
-            elif ref.startswith("SW"):
-                comp_h = 3.5
-                body_color = QColor(50, 50, 50)
-            elif ref.startswith("J"):
-                comp_h = 8.0  # Pin header height
-                body_color = QColor(30, 30, 30)
-            else:
-                comp_h = 1.0
-                body_color = COMP_BODY_PASSIVE
+            # Determine component height and color
+            comp_h, body_color = _classify_component(ref, comp.value)
 
-            # Component bounding box corners (on top of board)
-            cx = comp.position.x + fp_rect.x
-            cy = comp.position.y + fp_rect.y
-            cw = fp_rect.width
-            ch = fp_rect.height
+            # Skip mounting holes and zero-height items
+            if comp_h <= 0.0:
+                continue
 
-            d = depth(comp.position.x, comp.position.y, comp_h / 2)
+            # Get the footprint bounding rect (in local coordinates)
+            fp_rect = comp.footprint.bounding_rect()
 
-            def draw_comp(p=painter, ccx=cx, ccy=cy, ccw=cw, cch=ch,
-                         cc_h=comp_h, cc_color=body_color, cc_ref=comp.reference):
-                # Top face
-                top_corners = [
-                    project(ccx, ccy, cc_h),
-                    project(ccx + ccw, ccy, cc_h),
-                    project(ccx + ccw, ccy + cch, cc_h),
-                    project(ccx, ccy + cch, cc_h),
-                ]
-                # Bottom face (board surface)
-                bot_corners = [
-                    project(ccx, ccy, 0.1),
-                    project(ccx + ccw, ccy, 0.1),
-                    project(ccx + ccw, ccy + cch, 0.1),
-                    project(ccx, ccy + cch, 0.1),
-                ]
+            # Compute the 4 corners of the component body in local coords
+            local_corners = [
+                (fp_rect.x, fp_rect.y),
+                (fp_rect.x + fp_rect.width, fp_rect.y),
+                (fp_rect.x + fp_rect.width, fp_rect.y + fp_rect.height),
+                (fp_rect.x, fp_rect.y + fp_rect.height),
+            ]
 
-                # Draw sides (sorted by depth)
+            # Rotate each corner by the component rotation and translate
+            # to board coordinates
+            board_corners = []
+            for lx, ly in local_corners:
+                bx, by = rotate_point(
+                    lx, ly, comp.rotation, 0.0, 0.0
+                )
+                board_corners.append((
+                    comp.position.x + bx,
+                    comp.position.y + by,
+                ))
+
+            # Center for depth sorting
+            avg_x = sum(c[0] for c in board_corners) / 4
+            avg_y = sum(c[1] for c in board_corners) / 4
+            d = depth(avg_x, avg_y, comp_h / 2)
+
+            def draw_comp(p=painter, corners=board_corners,
+                         cc_h=comp_h, cc_color=body_color,
+                         cc_ref=comp.reference):
+                # Project all 8 corners (4 top + 4 bottom)
+                top_corners = [project(bx, by, cc_h) for bx, by in corners]
+                bot_corners = [project(bx, by, 0.1) for bx, by in corners]
+
+                # Draw sides (sorted by depth for correct overlap)
                 side_pairs = [(0, 1), (1, 2), (2, 3), (3, 0)]
                 s_depths = []
                 for si, sj in side_pairs:
-                    mid = (
-                        (bot_corners[si][0] + bot_corners[sj][0]) / 2,
-                        (bot_corners[si][1] + bot_corners[sj][1]) / 2,
-                    )
-                    s_depths.append((mid[1], si, sj))
+                    mid_sx = (corners[si][0] + corners[sj][0]) / 2
+                    mid_sy = (corners[si][1] + corners[sj][1]) / 2
+                    s_d = depth(mid_sx, mid_sy, cc_h / 2)
+                    s_depths.append((s_d, si, sj))
                 s_depths.sort(reverse=True)
 
                 side_color = QColor(
@@ -383,18 +486,53 @@ class Board3DWidget(QWidget):
                 p.setBrush(QBrush(cc_color))
                 p.drawPolygon(poly_t)
 
+                # Pin 1 marker (small dot on top face)
+                if len(top_corners) >= 1:
+                    p1x, p1y = top_corners[0]
+                    # Midpoint between corner 0 and center
+                    tcx = sum(pt[0] for pt in top_corners) / 4
+                    tcy = sum(pt[1] for pt in top_corners) / 4
+                    mx = p1x * 0.7 + tcx * 0.3
+                    my = p1y * 0.7 + tcy * 0.3
+                    dot_r = max(1.5, cam.zoom * 0.3)
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QBrush(QColor(255, 255, 255, 180)))
+                    p.drawEllipse(QPointF(mx, my), dot_r, dot_r)
+
                 # Reference text on top
-                center = project(ccx + ccw / 2, ccy + cch / 2, cc_h + 0.1)
+                tcx = sum(pt[0] for pt in top_corners) / 4
+                tcy = sum(pt[1] for pt in top_corners) / 4
                 font = QFont("Monospace", max(5, int(cam.zoom * 0.8)))
                 p.setFont(font)
                 p.setPen(QPen(SILK_COLOR))
                 p.drawText(
-                    QRectF(center[0] - 30, center[1] - 8, 60, 16),
+                    QRectF(tcx - 30, tcy - 8, 60, 16),
                     Qt.AlignmentFlag.AlignCenter,
                     cc_ref,
                 )
 
             render_items.append((d, draw_comp))
+
+        # Silk screen lines on board surface
+        for comp in board.components:
+            for silk in comp.footprint.silk_lines:
+                # Rotate silk line endpoints by component rotation
+                s_abs = silk.start.rotate(comp.rotation) + comp.position
+                e_abs = silk.end.rotate(comp.rotation) + comp.position
+                z = 0.08
+                sx1, sy1 = project(s_abs.x, s_abs.y, z)
+                sx2, sy2 = project(e_abs.x, e_abs.y, z)
+                d_val = depth(
+                    (s_abs.x + e_abs.x) / 2,
+                    (s_abs.y + e_abs.y) / 2, z)
+                lw = max(0.5, silk.width * cam.zoom * 0.4)
+
+                def draw_silk(p=painter, x1=sx1, y1=sy1, x2=sx2, y2=sy2,
+                             slw=lw):
+                    p.setPen(QPen(SILK_COLOR, slw))
+                    p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+                render_items.append((d_val, draw_silk))
 
         # Sort by depth (far objects first = painter's algorithm)
         render_items.sort(key=lambda item: item[0], reverse=True)
@@ -407,8 +545,11 @@ class Board3DWidget(QWidget):
         painter.setPen(QPen(QColor(150, 150, 150)))
         font = QFont("sans-serif", 10)
         painter.setFont(font)
+        comp_count = len(board.components)
+        net_count = len(board.nets)
         info_text = (
             f"Board: {bw:.0f} x {bh:.0f} mm  |  "
+            f"{comp_count} components, {net_count} nets  |  "
             f"Drag: rotate  |  Right-drag: pan  |  Scroll: zoom"
         )
         painter.drawText(10, h - 10, info_text)

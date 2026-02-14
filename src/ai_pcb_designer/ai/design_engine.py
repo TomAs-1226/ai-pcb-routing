@@ -773,6 +773,7 @@ class DesignEngine:
         """Compute board dimensions based on requested features.
 
         Aims for compact boards — smaller = cheaper to fabricate.
+        Counts total features and adds space proportionally.
         """
         if request.led_matrix:
             cols, rows = request.led_matrix
@@ -788,23 +789,65 @@ class DesignEngine:
         width = 50.0
         height = 40.0
 
-        # Grow only for features that genuinely need more room
+        # Count total feature complexity for proportional sizing
+        feature_count = 0
+
+        # Grow for features that genuinely need more room
         if request.camera:
             width = max(width, 60)
             height = max(height, 50)
+            feature_count += 2
         if request.display:
             height += 10
+            feature_count += 1
         if request.sd_card:
             width = max(width, 60)
+            feature_count += 1
         if request.motor_driver:
             width = max(width, 65)
             height = max(height, 50)
+            feature_count += request.motor_count
         if request.neopixel_strip > 0:
             width = max(width, request.neopixel_strip * 8 + 10)
+            feature_count += 1
         if request.screw_terminals > 0:
             width = max(width, request.screw_terminals * 6 + 20)
+            feature_count += 1
+        if request.relay:
+            # Relays are large - need significant extra space
+            width = max(width, 70)
+            height = max(height, 50 + request.relay_count * 15)
+            feature_count += request.relay_count * 2
+        if request.sensors:
+            height = max(height, 45 + len(request.sensors) * 8)
+            feature_count += len(request.sensors)
+        if request.buttons > 0:
+            height = max(height, 45 + request.buttons * 6)
+            feature_count += request.buttons
+        if request.leds > 0:
+            feature_count += request.leds
+        if request.gpio_header:
+            feature_count += 1
+        if request.debug_header or request.uart:
+            feature_count += 1
+        if request.i2c:
+            feature_count += 1
+        if request.spi:
+            feature_count += 1
+        if request.barrel_jack:
+            width = max(width, 55)
+            feature_count += 1
 
-        self._log.append(f"Board size: {width:.0f}x{height:.0f}mm")
+        # For complex boards with many features, add extra margin
+        if feature_count > 5:
+            extra = (feature_count - 5) * 3
+            width = max(width, width + extra * 0.5)
+            height = max(height, height + extra * 0.5)
+
+        self._log.append(
+            f"Board size: {width:.0f}x{height:.0f}mm "
+            f"({feature_count} features)"
+        )
         return width, height
 
     # ── STM32 Section ─────────────────────────────────────────────────────
@@ -1173,8 +1216,9 @@ class DesignEngine:
     ) -> list[PlacedComponent]:
         """Add SPDT relays with transistor drivers and flyback diodes."""
         placed: list[PlacedComponent] = []
-        # ESP32 GPIO pins safe for relay control
-        gpio_pins = ["IO13", "IO14", "IO27", "IO26", "IO25", "IO33", "IO32", "IO4"]
+        # ESP32 GPIO numeric pin numbers safe for relay control
+        # IO13=16, IO14=13, IO27=12, IO26=11, IO25=10, IO33=9, IO32=8, IO4=26
+        gpio_pins = ["16", "13", "12", "11", "10", "9", "8", "26"]
 
         for i in range(min(count, 4)):
             y_pos = board_height / 2 - 10 + i * 22
@@ -1282,9 +1326,9 @@ class DesignEngine:
                 )
                 pcb.power_net("3V3", [(header, "1")])
                 pcb.power_net("GND", [(header, "2")])
-                # Wire to I2C bus
-                pcb.net("I2C_SDA", [(header, "3"), (mcu_comp, "IO21")])
-                pcb.net("I2C_SCL", [(header, "4"), (mcu_comp, "IO22")])
+                # Wire to I2C bus (IO21=pin 33, IO22=pin 36)
+                pcb.net("I2C_SDA", [(header, "3"), (mcu_comp, "33")])
+                pcb.net("I2C_SCL", [(header, "4"), (mcu_comp, "36")])
 
                 if not i2c_added:
                     # Add pull-ups once
@@ -1315,11 +1359,12 @@ class DesignEngine:
                 )
                 pcb.power_net("3V3", [(header, "1")])
                 pcb.power_net("GND", [(header, "2")])
-                pcb.net("SPI_SCK", [(header, "3"), (mcu_comp, "IO18")])
-                pcb.net("SPI_MOSI", [(header, "4"), (mcu_comp, "IO23")])
-                pcb.net("SPI_MISO", [(header, "5"), (mcu_comp, "IO19")])
+                # IO18=pin 30, IO23=pin 37, IO19=pin 31, IO5=pin 29
+                pcb.net("SPI_SCK", [(header, "3"), (mcu_comp, "30")])
+                pcb.net("SPI_MOSI", [(header, "4"), (mcu_comp, "37")])
+                pcb.net("SPI_MISO", [(header, "5"), (mcu_comp, "31")])
                 pcb.net(f"SPI_CS_{sensor.upper()}", [
-                    (header, "6"), (mcu_comp, "IO5"),
+                    (header, "6"), (mcu_comp, "29"),
                 ])
                 placed.append(header)
 
@@ -1331,7 +1376,8 @@ class DesignEngine:
                     pos=(board_width - 8, y_pos),
                     description=f"GPIO sensor: {sensor.upper()}",
                 )
-                gpio_pins = ["IO4", "IO16", "IO17", "IO25"]
+                # ESP32 numeric pin numbers: IO4=26, IO16=27, IO17=28, IO25=10
+                gpio_pins = ["26", "27", "28", "10"]
                 gpio = gpio_pins[idx % len(gpio_pins)]
                 pcb.power_net("3V3", [(header, "1")])
                 pcb.power_net("GND", [(header, "2")])
