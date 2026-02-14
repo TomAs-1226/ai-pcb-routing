@@ -488,6 +488,180 @@ class PCBDesignAgent:
 
     # ─── Helpers ─────────────────────────────────────────────────────────
 
+    def edit(self, edit_request: str) -> Board | None:
+        """Apply an incremental edit to the current board via LLM.
+
+        This powers the chat-based editing flow: after the initial design
+        is complete, the user can send follow-up requests like "move U1
+        to the left", "add a second LED", "remove the debug header", etc.
+
+        The LLM receives the current board state (components, nets,
+        board size) and generates modification code that operates on the
+        existing PCBDesign.
+
+        Returns the updated board on success, or the original board on
+        failure.
+        """
+        if self._board is None:
+            self._emit(AgentPhase.FAILED, "No board to edit — design one first.")
+            return None
+
+        if self.config.llm_provider in ("template", ""):
+            self._emit(
+                AgentPhase.ANALYZING,
+                "Edit requires an LLM provider (OpenAI or Anthropic). "
+                "Select one in the LLM dropdown.",
+            )
+            return self._board
+
+        self._cancel_event.clear()
+        self._emit(
+            AgentPhase.ANALYZING,
+            f"Editing board: {edit_request}",
+            progress=0.05,
+        )
+
+        try:
+            board = self._apply_edit_via_llm(edit_request)
+            if board is None:
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    "Edit failed — keeping original board.",
+                )
+                return self._board
+
+            # Re-place, re-route, re-DRC
+            self._emit(
+                AgentPhase.PLACING_COMPONENTS,
+                "Re-placing components after edit...",
+                progress=0.30,
+            )
+            placer = PlacementEngine(PlacementConfig(seed=42))
+            placer.place(board)
+
+            self._emit(
+                AgentPhase.ROUTING_TRACES,
+                "Re-routing traces...",
+                progress=0.50,
+                board=board,
+            )
+            board.clear_routing()
+            router = AutoRouter(RouterConfig(via_cost=30.0))
+            all_routed, _ = router.route(board)
+            self._emit(
+                AgentPhase.ROUTING_TRACES,
+                f"Routing {'complete' if all_routed else 'partial'}.",
+                progress=0.65,
+                board=board,
+            )
+
+            # Quick DRC
+            drc_engine = DRCEngine()
+            drc_result = drc_engine.check(board)
+            if not drc_result.passed:
+                self._emit(
+                    AgentPhase.FIXING_ISSUES,
+                    f"DRC: {drc_result.error_count} errors — attempting fix...",
+                    progress=0.75,
+                )
+                self._attempt_drc_fix(board, drc_result)
+                board.clear_routing()
+                router2 = AutoRouter(RouterConfig(via_cost=20.0))
+                router2.route(board)
+
+            self._board = board
+            self._emit(
+                AgentPhase.COMPLETE,
+                "Edit applied successfully!",
+                progress=1.0,
+                board=board,
+            )
+            return board
+
+        except Exception as e:
+            self._emit(AgentPhase.FAILED, f"Edit failed: {e}")
+            return self._board
+
+    def _apply_edit_via_llm(self, edit_request: str) -> Board | None:
+        """Send the current board state + edit request to the LLM."""
+        board = self._board
+        if board is None:
+            return None
+
+        # Build a description of the current board for the LLM
+        comp_lines = []
+        for c in board.components:
+            comp_lines.append(
+                f"  {c.reference}: {c.footprint.name} "
+                f"value={c.value!r} pos=({c.position.x:.1f}, {c.position.y:.1f})"
+            )
+        net_lines = []
+        for n in board.nets:
+            pads = ", ".join(f"({r}, '{p}')" for r, p in n.pad_refs)
+            net_lines.append(f"  {n.name}: [{pads}]")
+
+        board_state = (
+            f"Current board: {board.name}\n"
+            f"Size: {board.settings.width}x{board.settings.height}mm\n"
+            f"Components ({len(board.components)}):\n"
+            + "\n".join(comp_lines)
+            + f"\n\nNets ({len(board.nets)}):\n"
+            + "\n".join(net_lines)
+        )
+
+        system_prompt = self._build_system_prompt()
+        user_prompt = (
+            f"You have an EXISTING board. The user wants to EDIT it.\n\n"
+            f"{board_state}\n\n"
+            f"User's edit request: {edit_request}\n\n"
+            f"Generate COMPLETE Python code that recreates the board with "
+            f"the requested changes applied. Keep all unchanged components "
+            f"and nets. Use the PCBDesign DSL.\n"
+            f"Output ONLY Python code ending with: board = pcb.build()"
+        )
+
+        provider = self.config.llm_provider
+        api_key = self.config.api_key
+
+        self._last_llm_code = ""
+        self._last_llm_error = ""
+
+        for attempt in range(3):
+            try:
+                if provider == "openai":
+                    code = self._call_openai(system_prompt, user_prompt, api_key)
+                elif provider == "anthropic":
+                    code = self._call_anthropic(system_prompt, user_prompt, api_key)
+                else:
+                    return None
+
+                if not code:
+                    return None
+
+                new_board = self._execute_llm_code(code)
+                if new_board is not None:
+                    return new_board
+
+                # Feed error back
+                error_msg = getattr(self, "_last_llm_error", "unknown")
+                failed_code = getattr(self, "_last_llm_code", "")[:600]
+                user_prompt = (
+                    f"Your previous edit code FAILED: {error_msg}\n\n"
+                    f"Failed code:\n```python\n{failed_code}\n```\n\n"
+                    f"Fix and regenerate. Original edit request: {edit_request}\n"
+                    f"Board state:\n{board_state}"
+                )
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    f"Edit attempt {attempt + 1} failed: {error_msg}",
+                    progress=0.10 + attempt * 0.05,
+                )
+            except Exception as e:
+                self._emit(AgentPhase.ANALYZING, f"Edit attempt {attempt + 1}: {e}")
+                continue
+
+        return None
+
     @staticmethod
     def _components_have_positions(board: Board) -> bool:
         """Check if components already have non-origin positions (from DSL)."""
@@ -1015,13 +1189,101 @@ Sensor_I2C_4pin: 1=VCC, 2=GND, 3=SDA, 4=SCL
 Sensor_SPI_6pin: 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
 {subcircuit_info}
 
+## Component Categories — Use These Directly with pcb.place()
+
+**Passives** (pins: 1, 2):
+  R_0402, R_0603, R_0805 — Resistors
+  C_0402, C_0603, C_0805 — Capacitors
+  L_0805 — Inductor
+
+**LEDs** (pins: 1=Anode, 2=Cathode):
+  LED_0603, LED_0805
+
+**Diodes** (pins: K=Cathode, A=Anode):
+  SOD-123 — Schottky / signal diode
+
+**Addressable LEDs** (pins: 1=VDD, 2=DOUT, 3=GND, 4=DIN):
+  WS2812B
+
+**Transistors / MOSFETs**:
+  SOT-23-3 — pins: 1=Base/Gate, 2=Emitter/Source, 3=Collector/Drain
+  SOT-89 — pins: 1, 2, 3
+  DPAK_TO252 — pins: 1=Gate, 2=Drain(tab), 3=Source
+  TO-220 — pins: 1, 2, 3
+
+**Voltage Regulators**:
+  SOT-223 — pins: 1=Input, 2=Ground, 3=Output
+
+**ICs**:
+  ESP32-WROOM-32 — 39-pin WiFi/BT MCU
+  QFP-48 — generic 48-pin IC (STM32, etc.)
+  SOIC-8 — 8-pin SPI flash, op-amp, etc. (pins: 1-8)
+  DIP-8 — through-hole 8-pin IC (pins: 1-8)
+
+**Connectors**:
+  USB_C_16pin — USB-C (A1=GND,A4=VBUS,A6=D+,A7=D-,B1=GND,B4=VBUS,...)
+  USB_Micro_B — USB Micro-B (1=VBUS,2=D-,3=D+,4=ID,5=GND)
+  BarrelJack_DC — DC jack (1=Tip/VIN, 2=Sleeve/GND, 3=Switch)
+  PinHeader_1x02 through PinHeader_1x19 — pin headers (pins: 1,2,3,...)
+  PinHeader_2x03, 2x05, 2x10 — dual-row headers
+  ScrewTerminal_2P, 3P — screw terminals (pins: 1,2 or 1,2,3)
+
+**Storage / Display**:
+  MicroSD_Socket — pins: 1-9 (CS=1, MOSI=2, VSS=3, VDD=4, CLK=5, VSS2=6, DO=7)
+  OLED_SSD1306 — 4-pin I2C OLED (1=GND, 2=VCC, 3=SCL, 4=SDA)
+  FPC_8pin, FPC_24pin, FPC_40pin — flat-flex connectors
+
+**Switches / Relays**:
+  SW_Push_6mm — tactile switch (1,2=side A, 3,4=side B)
+  SW_Push_SMD — SMD pushbutton (1,2)
+  Relay_SPDT — 5V relay (1=Coil+, 2=Coil-, 3=COM, 4=NO, 5=NC)
+
+**Oscillators**:
+  Crystal_3215 — 32.768kHz crystal (1, 2)
+
+**Sensor Headers**:
+  Sensor_I2C_4pin — 1=VCC, 2=GND, 3=SDA, 4=SCL
+  Sensor_SPI_6pin — 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
+
+**Mounting**:
+  MountingHole_M3, MountingHole_M2.5 — (pin: 1)
+
+Example — OLED display with I2C:
+```python
+oled = pcb.place("U2", "OLED_SSD1306", value="SSD1306", pos=(30, 35))
+pcb.power_net("3V3", [(mcu, "2"), (oled, "2")])
+pcb.power_net("GND", [(mcu, "1"), (oled, "1")])
+pcb.net("I2C_SCL", [(mcu, "36"), (oled, "3")])
+pcb.net("I2C_SDA", [(mcu, "33"), (oled, "4")])
+```
+
+Example — MicroSD card reader:
+```python
+sd = pcb.place("J2", "MicroSD_Socket", value="MicroSD", pos=(50, 30))
+pcb.net("SD_CS", [(mcu, "29"), (sd, "1")])
+pcb.net("SD_MOSI", [(mcu, "37"), (sd, "2")])
+pcb.net("SD_CLK", [(mcu, "30"), (sd, "5")])
+pcb.net("SD_MISO", [(mcu, "31"), (sd, "7")])
+```
+
+Example — MOSFET motor driver:
+```python
+q1 = pcb.place("Q1", "SOT-23-3", value="2N7002", pos=(45, 30))
+r_gate = pcb.place("R5", "R_0603", value="100", pos=(42, 28))
+r_pull = pcb.place("R6", "R_0603", value="10k", pos=(42, 32))
+pcb.net("MOTOR_GATE", [(r_gate, "2"), (q1, "1")])
+pcb.net("MOTOR_CTRL", [(mcu, "8"), (r_gate, "1")])
+pcb.power_net("GND", [(q1, "2"), (r_pull, "2")])
+pcb.net("MOTOR_GATE", [(r_pull, "1"), (q1, "1")])
+```
+
 ## Design Rules (CRITICAL)
 
 1. EVERY IC must have at least one 100nF bypass cap within 5mm
 2. EVERY IC must be connected to power AND ground nets
 3. Use power_net() for GND, VCC, 3V3, 5V, VBUS (wider traces)
 4. Use net() for signal connections (standard traces)
-5. Place USB/barrel jack connectors at board edges (y < 10mm from top or x < 10mm from edge)
+5. Place USB/barrel jack connectors at board edges (y < 10mm from top)
 6. ALL components must fit inside board boundaries with 3mm margin
 7. Space components at least 2mm apart to avoid overlaps
 8. Include pull-up resistors on EN/RESET pins (10k to 3V3)
@@ -1030,29 +1292,24 @@ Sensor_SPI_6pin: 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
 11. Reference designator prefixes: U=IC, R=Resistor, C=Capacitor,
     D=Diode/LED, J=Connector, SW=Switch, H=Mounting Hole, L=Inductor,
     Q=Transistor/MOSFET, K=Relay
-12. For relays: ALWAYS include a flyback diode (SOD-123) and an NPN
-    driver transistor (SOT-23-3 2N2222) — never drive a relay coil
-    directly from a GPIO pin
-13. For power MOSFETs: include a gate resistor (100Ω) and a
-    gate pull-down (10k)
-14. For I2C buses: include 4.7k pull-ups on SDA and SCL
-15. For barrel jacks: include a polarity-protection Schottky diode
+12. For relays: include a flyback diode (SOD-123) and NPN driver
+    transistor (SOT-23-3) — never drive relay coil from GPIO directly
+13. For power MOSFETs: include gate resistor (100 ohm) + pull-down (10k)
+14. For I2C: include 4.7k pull-ups on SDA and SCL
+15. For barrel jacks: include polarity-protection Schottky diode
 
 ## Layout Guidelines
 
 - Board origin is top-left (0,0)
 - **SIZE THE BOARD COMPACT** — don't waste space.  Typical boards:
-  - Simple sensor board: 40×30mm
-  - ESP32 + a few peripherals: 50×40mm
-  - ESP32 + display + camera: 60×50mm
-  - Complex multi-feature: 70×55mm
+  - Simple sensor board: 40x30mm
+  - ESP32 + a few peripherals: 50x40mm
+  - Complex multi-feature: 70x55mm
 - Connectors go at edges: USB at top center, headers on right
 - Main IC centered: pos=(width/2, 20-30)
 - Passives within 3mm of their IC (decoupling caps < 3mm!)
 - Power section near USB / barrel jack connector
 - Leave 3mm margin from all edges
-- For NxM LED matrices: 10mm pitch, serpentine data wiring
-- Place relays / high-power components away from sensitive signals
 
 Output ONLY the Python code, no explanations. The code MUST end with:
 board = pcb.build()

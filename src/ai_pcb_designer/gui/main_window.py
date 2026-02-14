@@ -250,6 +250,31 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(layer_group)
 
+        # Chat / Edit section (visible after design completes)
+        self._chat_group = QGroupBox("Chat — Edit Board")
+        chat_layout = QVBoxLayout(self._chat_group)
+
+        self._chat_input = QLineEdit()
+        self._chat_input.setPlaceholderText(
+            "Ask the AI to modify the board... (e.g. 'add a second LED', "
+            "'move U1 to the left', 'remove the debug header')"
+        )
+        self._chat_input.returnPressed.connect(self._on_chat_send)
+        chat_layout.addWidget(self._chat_input)
+
+        self._chat_send_btn = QPushButton("Send Edit")
+        self._chat_send_btn.setStyleSheet(
+            "QPushButton { background-color: #2d6b8c; color: white; "
+            "font-weight: bold; border-radius: 4px; padding: 6px; }"
+            "QPushButton:hover { background-color: #3a8ab0; }"
+            "QPushButton:disabled { background-color: #555; color: #999; }"
+        )
+        self._chat_send_btn.clicked.connect(self._on_chat_send)
+        chat_layout.addWidget(self._chat_send_btn)
+
+        self._chat_group.setVisible(False)  # hidden until first design finishes
+        right_layout.addWidget(self._chat_group)
+
         # Board info
         self._board_info = QLabel("No board loaded")
         self._board_info.setWordWrap(True)
@@ -394,6 +419,8 @@ class MainWindow(QMainWindow):
         """Called when the design thread completes."""
         self._design_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        self._chat_send_btn.setEnabled(True)
+        self._chat_input.setEnabled(True)
 
         if board is not None:
             self._renderer.render_board(board)
@@ -401,6 +428,9 @@ class MainWindow(QMainWindow):
 
             # Show 3D view
             self._show_3d_view(board)
+
+            # Show chat box for iterative editing
+            self._chat_group.setVisible(True)
 
             # Update board info
             summary = board.summary()
@@ -425,6 +455,35 @@ class MainWindow(QMainWindow):
             error_label.setWordWrap(True)
             self._view_tabs.removeTab(1)
             self._view_tabs.insertTab(1, error_label, "3D View")
+
+    def _on_chat_send(self) -> None:
+        """Send an edit request to the AI via the chat box."""
+        edit_text = self._chat_input.text().strip()
+        if not edit_text:
+            return
+        if not self._agent or not self._agent.board:
+            QMessageBox.information(
+                self, "No Board",
+                "Design a board first before sending edit requests.",
+            )
+            return
+
+        # Disable inputs during edit
+        self._chat_input.clear()
+        self._chat_send_btn.setEnabled(False)
+        self._chat_input.setEnabled(False)
+        self._design_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+
+        self._step_log.appendPlainText(f"\n--- EDIT: {edit_text} ---")
+        self._progress_bar.setValue(0)
+
+        def run_edit():
+            board = self._agent.edit(edit_text) if self._agent else None
+            self._step_signal.design_finished.emit(board)
+
+        self._design_thread = threading.Thread(target=run_edit, daemon=True)
+        self._design_thread.start()
 
     def _on_layer_toggled(self, layer_name: str, checked: bool) -> None:
         self._renderer.set_layer_visible(layer_name, checked)

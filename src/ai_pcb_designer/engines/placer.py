@@ -28,7 +28,7 @@ class PlacementConfig:
     """Configuration for the placement engine."""
     grid_snap: float = 0.5
     padding: float = 1.5          # mm, min courtyard-to-courtyard spacing
-    edge_margin: float = 1.5      # mm, margin from board edge (was 2.5)
+    edge_margin: float = 2.5      # mm, margin from board edge
     max_iterations: int = 300
     attraction_strength: float = 0.20   # pull connected comps together (was 0.08)
     repulsion_strength: float = 10.0    # push overlaps apart harder (was 5.0)
@@ -177,11 +177,12 @@ class PlacementEngine:
     ) -> None:
         """Place connectors at edges and mounting holes at corners."""
         corner_idx = 0
+        hole_inset = 5.0  # match subcircuit mounting_holes_corners
         corners = [
-            Point(margin + 2, margin + 2),
-            Point(bw - margin - 2, margin + 2),
-            Point(margin + 2, bh - margin - 2),
-            Point(bw - margin - 2, bh - margin - 2),
+            Point(hole_inset, hole_inset),
+            Point(bw - hole_inset, hole_inset),
+            Point(hole_inset, bh - hole_inset),
+            Point(bw - hole_inset, bh - hole_inset),
         ]
 
         for comp in comps:
