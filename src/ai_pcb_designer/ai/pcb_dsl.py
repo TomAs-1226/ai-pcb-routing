@@ -33,6 +33,29 @@ from ..core.net import Net, NetClass
 from ..components.footprints import get_footprint, list_footprints
 
 
+class _SubcircuitResult(dict):
+    """Dict subclass that gives helpful KeyError messages.
+
+    When the LLM accesses a wrong key (e.g. ``ldo['3V3']`` instead of
+    ``ldo['ldo']``), the error message lists all available keys so the
+    LLM can self-correct on the next retry.
+    """
+
+    def __init__(self, data: dict, subcircuit_name: str) -> None:
+        super().__init__(data)
+        self._subcircuit_name = subcircuit_name
+
+    def __getitem__(self, key):
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            available = ", ".join(sorted(self.keys()))
+            raise KeyError(
+                f"subcircuit '{self._subcircuit_name}' has no component "
+                f"'{key}'. Available keys: {available}"
+            ) from None
+
+
 @dataclass
 class PlacedComponent:
     """A component placed via the DSL. Stores reference for net wiring."""
@@ -212,18 +235,35 @@ class PCBDesign:
                       function (e.g. ``color="red"`` for ``led_with_resistor``).
 
         Returns:
-            Dict of ``{symbolic_name: PlacedComponent}`` — keys depend
-            on the subcircuit.
+            ``_SubcircuitResult`` dict of ``{symbolic_name: PlacedComponent}``.
+            Accessing a non-existent key gives a helpful error listing
+            the available keys.
         """
-        from .subcircuits import SUBCIRCUIT_REGISTRY
+        from .subcircuits import SUBCIRCUIT_REGISTRY, SUBCIRCUIT_RETURN_KEYS
 
         entry = SUBCIRCUIT_REGISTRY.get(name)
+
+        # Fuzzy match: if exact name not found, try partial matching
+        # so "sensor" matches "i2c_sensor_breakout", "ldo" matches "ldo_3v3"
         if entry is None:
-            available = ", ".join(sorted(SUBCIRCUIT_REGISTRY.keys()))
-            raise ValueError(
-                f"Unknown subcircuit '{name}'. "
-                f"Available: {available}"
-            )
+            candidates = [
+                n for n in SUBCIRCUIT_REGISTRY
+                if name in n or n in name
+            ]
+            if len(candidates) == 1:
+                name = candidates[0]
+                entry = SUBCIRCUIT_REGISTRY[name]
+            elif len(candidates) > 1:
+                raise ValueError(
+                    f"Ambiguous subcircuit name '{name}'. "
+                    f"Did you mean one of: {', '.join(candidates)}?"
+                )
+            else:
+                available = ", ".join(sorted(SUBCIRCUIT_REGISTRY.keys()))
+                raise ValueError(
+                    f"Unknown subcircuit '{name}'. "
+                    f"Available: {available}"
+                )
 
         if ref_start is None:
             ref_start = self._ref_counter
@@ -237,10 +277,14 @@ class PCBDesign:
         sig = inspect.signature(func)
         params = list(sig.parameters.keys())
         if "board_width" in params and "board_height" in params:
-            return func(self, ref_start=ref_start,
-                        board_width=self.width, board_height=self.height,
-                        **kwargs)
-        return func(self, ref_start=ref_start, pos=pos, **kwargs)
+            result = func(self, ref_start=ref_start,
+                          board_width=self.width, board_height=self.height,
+                          **kwargs)
+        else:
+            result = func(self, ref_start=ref_start, pos=pos, **kwargs)
+
+        # Wrap in _SubcircuitResult for better KeyError messages
+        return _SubcircuitResult(result, name)
 
     def text(
         self,

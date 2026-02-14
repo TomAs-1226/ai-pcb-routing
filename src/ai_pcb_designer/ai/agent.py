@@ -882,21 +882,46 @@ class PCBDesignAgent:
         try:
             from .subcircuits import list_subcircuits
             subcircuit_info = (
-                "\n\n## Subcircuit Convenience Method\n\n"
-                "Place pre-built subcircuits with `pcb.subcircuit()`:\n"
+                "\n\n## Subcircuit Convenience Method (PREFERRED)\n\n"
+                "Use `pcb.subcircuit()` to place pre-built circuit blocks.\n"
+                "No imports needed, ref numbering is automatic.\n\n"
                 "```python\n"
-                "# Place subcircuits — ref_start is auto-managed, no imports needed\n"
+                "# Place subcircuits — returns a dict of PlacedComponents\n"
                 "pwr = pcb.subcircuit('usb_c_power', pos=(35, 5))\n"
-                "ldo = pcb.subcircuit('ldo_3v3', pos=(55, 10))\n"
-                "mcu = pcb.subcircuit('esp32_minimal', pos=(35, 30))\n"
-                "led1 = pcb.subcircuit('led_with_resistor', pos=(60, 40), color='green')\n"
-                "dbg = pcb.subcircuit('debug_header', pos=(70, 50))\n"
-                "holes = pcb.subcircuit('mounting_holes_corners', pos=(0,0))  # uses board dims\n"
+                "# pwr keys: 'usb', 'c_filter1', 'c_filter2'\n"
                 "\n"
-                "# Cross-wire subcircuit components via their returned dicts:\n"
+                "ldo = pcb.subcircuit('ldo_3v3', pos=(55, 10))\n"
+                "# ldo keys: 'ldo', 'c_in', 'c_out'\n"
+                "\n"
+                "mcu = pcb.subcircuit('esp32_minimal', pos=(35, 30))\n"
+                "# mcu keys: 'esp32', 'c_byp1', 'c_byp2', 'r_en', 'r_io0', "
+                "'btn_reset', 'btn_boot'\n"
+                "\n"
+                "sensor = pcb.subcircuit('i2c_sensor_breakout', pos=(20, 40))\n"
+                "# sensor keys: 'header', 'r_sda', 'r_scl'\n"
+                "\n"
+                "led1 = pcb.subcircuit('led_with_resistor', pos=(60, 40), color='green')\n"
+                "# led1 keys: 'resistor', 'led'\n"
+                "\n"
+                "dbg = pcb.subcircuit('debug_header', pos=(70, 50))\n"
+                "# dbg keys: 'header'\n"
+                "\n"
+                "holes = pcb.subcircuit('mounting_holes_corners', pos=(0,0))\n"
+                "# holes keys: 'hole_tl', 'hole_tr', 'hole_br', 'hole_bl'\n"
+                "```\n\n"
+                "**CRITICAL: Accessing return dict keys**\n"
+                "The dict keys are component NAMES, NOT net names!\n"
+                "```python\n"
+                "# CORRECT — use component key names from the dict:\n"
                 "pcb.power_net('VBUS', [(pwr['usb'], 'A4'), (ldo['ldo'], '1')])\n"
                 "pcb.power_net('3V3', [(ldo['ldo'], '3'), (mcu['esp32'], '2')])\n"
+                "pcb.net('SDA', [(mcu['esp32'], '33'), (sensor['header'], '3')])\n"
                 "pcb.net('LED_GPIO', [(mcu['esp32'], '8'), (led1['resistor'], '1')])\n"
+                "\n"
+                "# WRONG — these are net names, NOT dict keys:\n"
+                "# ldo['3V3']  ← KeyError! Use ldo['ldo'] instead\n"
+                "# sensor['sensor']  ← KeyError! Use sensor['header'] instead\n"
+                "# mcu['3V3']  ← KeyError! Use mcu['esp32'] instead\n"
                 "```\n\n"
                 + list_subcircuits()
             )
@@ -1305,10 +1330,22 @@ board = pcb.build()
         try:
             exec(code, namespace)  # noqa: S102
         except Exception as exc:
-            self._last_llm_error = str(exc)
+            import traceback
+            # Extract the line number from the traceback for better feedback
+            tb = traceback.extract_tb(exc.__traceback__)
+            line_info = ""
+            for frame in tb:
+                if frame.filename == "<string>":
+                    line_info = f" (line {frame.lineno})"
+                    break
+            error_type = type(exc).__name__
+            self._last_llm_error = (
+                f"{error_type}: {exc}{line_info}"
+            )
             self._emit(
                 AgentPhase.ANALYZING,
-                f"LLM-generated code execution failed: {exc}",
+                f"LLM-generated code execution failed: "
+                f"{error_type}: {exc}{line_info}",
                 detail=code[:500],
             )
             return None

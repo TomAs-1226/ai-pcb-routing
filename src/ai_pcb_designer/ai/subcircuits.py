@@ -1360,6 +1360,39 @@ def mosfet_switch(
 # Subcircuit Registry
 # ===========================================================================
 
+# Return-key documentation: maps subcircuit name → list of dict keys
+# returned by the function.  LLMs need this to wire subcircuits together.
+SUBCIRCUIT_RETURN_KEYS: dict[str, list[str]] = {
+    "usb_c_power": ["usb", "c_filter1", "c_filter2"],
+    "usb_micro_power": ["usb", "c_filter"],
+    "ldo_3v3": ["ldo", "c_in", "c_out"],
+    "ldo_5v": ["ldo", "c_in", "c_out"],
+    "buck_converter": ["ic", "inductor", "c_in", "c_out"],
+    "esp32_minimal": ["esp32", "c_byp1", "c_byp2", "r_en", "r_io0",
+                       "btn_reset", "btn_boot"],
+    "stm32_minimal": ["mcu", "c_byp1", "c_byp2", "c_byp3", "r_reset",
+                       "c_reset", "btn_reset"],
+    "i2c_pullups": ["r_sda", "r_scl"],
+    "uart_header": ["header"],
+    "spi_header": ["header"],
+    "debug_header": ["header"],
+    "led_with_resistor": ["resistor", "led"],
+    "button_with_pullup": ["btn", "resistor", "cap"],
+    "voltage_divider": ["r_top", "r_bottom"],
+    "decoupling_cap": ["cap"],
+    "mounting_holes_corners": ["hole_tl", "hole_tr", "hole_br", "hole_bl"],
+    "neopixel_strip": ["led_0", "led_1", "c_bulk"],
+    "crystal_oscillator": ["crystal", "c_load1", "c_load2"],
+    "h_bridge": ["q_ah", "q_al", "q_bh", "q_bl", "d_ah", "d_al",
+                  "d_bh", "d_bl"],
+    "barrel_jack_power": ["jack", "diode", "c_filter"],
+    "relay_driver": ["relay", "transistor", "diode", "r_base"],
+    "i2c_sensor_breakout": ["header", "r_sda", "r_scl"],
+    "spi_sensor_breakout": ["header"],
+    "mosfet_switch": ["mosfet", "r_gate", "r_pulldown"],
+}
+
+
 SUBCIRCUIT_REGISTRY: dict[str, tuple[callable, str, list[str]]] = {
     "usb_c_power": (
         usb_c_power,
@@ -1491,16 +1524,21 @@ SUBCIRCUIT_REGISTRY: dict[str, tuple[callable, str, list[str]]] = {
 def list_subcircuits() -> str:
     """Return a formatted multi-line string listing all available subcircuits.
 
-    Each entry shows the function name, a one-line description, and the
-    internal power/signal nets that are wired automatically.
+    Each entry shows the function name, a one-line description, the
+    internal power/signal nets wired automatically, and — critically —
+    the dict keys returned so the caller knows how to reference the
+    placed components.
     """
     lines = ["Available subcircuit building blocks:", ""]
 
     for name, (func, description, nets) in sorted(SUBCIRCUIT_REGISTRY.items()):
         nets_str = ", ".join(nets) if nets else "(none)"
+        keys = SUBCIRCUIT_RETURN_KEYS.get(name, [])
+        keys_str = ", ".join(keys) if keys else "(none)"
         lines.append(f"  {name}")
         lines.append(f"    {description}")
         lines.append(f"    Internal nets: {nets_str}")
+        lines.append(f"    Returns dict keys: {keys_str}")
         lines.append("")
 
     return "\n".join(lines)
