@@ -144,11 +144,12 @@ class PCBDesignAgent:
             if self._is_cancelled():
                 return None
 
-            # Phase 1: Create custom design (primary) or match template (fallback)
+            # Phase 1: Create custom design
+            # Priority: design engine → LLM → strict template match → default
             board = self._create_custom_design(user_request)
 
             if board is None:
-                # Fallback: try strict template matching (needs 2+ keywords)
+                # Fallback: strict template match or default starter
                 template_name = self._match_template(user_request)
                 if template_name:
                     self._emit(
@@ -159,15 +160,12 @@ class PCBDesignAgent:
                     )
                     board = create_board_from_template(template_name)
                 else:
-                    # Try LLM, then ultimate fallback
-                    board = self._generate_from_llm(user_request)
-                    if board is None:
-                        self._emit(
-                            AgentPhase.SELECTING_COMPONENTS,
-                            "Using LED blinker as default starter board.",
-                            progress=0.08,
-                        )
-                        board = create_board_from_template("led_blinker")
+                    self._emit(
+                        AgentPhase.SELECTING_COMPONENTS,
+                        "Using LED blinker as default starter board.",
+                        progress=0.08,
+                    )
+                    board = create_board_from_template("led_blinker")
 
             self._board = board
 
@@ -487,7 +485,7 @@ class PCBDesignAgent:
         try:
             request = parse_request(user_request)
 
-            # If the request is too vague (no MCU, no features), skip
+            # If the request is too vague (no MCU, no features), let LLM handle it
             has_features = (
                 request.led_matrix is not None
                 or request.debug_header
@@ -498,7 +496,8 @@ class PCBDesignAgent:
                 or request.logo_text
             )
             if not has_features:
-                return None
+                # Try LLM for novel designs the hardcoded engine can't handle
+                return self._generate_from_llm(user_request)
 
             self._emit(
                 AgentPhase.SELECTING_COMPONENTS,
@@ -572,114 +571,294 @@ class PCBDesignAgent:
         except Exception:
             pass  # Validation is advisory; don't block the pipeline
 
-    # ─── LLM-based Generation ────────────────────────────────────────────
+    # ─── LLM-based Design (thinking-capable models) ─────────────────────
 
     def _generate_from_llm(self, request: str) -> Board | None:
+        """Use a thinking-capable LLM to design a novel PCB from scratch.
+
+        The LLM receives the full PCBDesign DSL reference, all available
+        footprints with pin maps, and the subcircuit library.  It then
+        generates Python code that composes a complete board.
+
+        Supports OpenAI (o3-mini / o4-mini / gpt-4o) and Anthropic.
+        Includes a validation-and-retry loop for self-correction.
+        """
         provider = self.config.llm_provider
 
         if provider == "template" or not self.config.api_key:
             return None
 
+        self._emit(
+            AgentPhase.ANALYZING,
+            "Using AI to design a novel PCB from scratch...",
+            f"Provider: {provider}, model: {self.config.model or 'auto'}",
+            progress=0.04,
+        )
+
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(request)
 
-        try:
-            if provider == "openai":
-                return self._call_openai(system_prompt, user_prompt)
-            elif provider == "anthropic":
-                return self._call_anthropic(system_prompt, user_prompt)
-        except Exception as e:
-            self._emit(
-                AgentPhase.ANALYZING,
-                f"LLM call failed ({e}), falling back to template matching",
-            )
-            return None
+        # Try up to 3 iterations: generate → validate → feedback → retry
+        last_code = ""
+        for attempt in range(3):
+            try:
+                if provider == "openai":
+                    code = self._call_openai(system_prompt, user_prompt)
+                elif provider == "anthropic":
+                    code = self._call_anthropic(system_prompt, user_prompt)
+                else:
+                    return None
+
+                if not code:
+                    return None
+
+                last_code = code
+                board = self._execute_llm_code(code)
+                if board is None:
+                    continue
+
+                # Validate the LLM-generated board
+                validator = DesignValidator()
+                score = validator.validate(board)
+
+                if score.is_feasible:
+                    self._emit(
+                        AgentPhase.CREATING_SCHEMATIC,
+                        f"AI-designed board (score: {score.total:.0f}/100)",
+                        detail=score.summary(),
+                        progress=0.10,
+                        board=board,
+                    )
+                    return board
+
+                # Not feasible — feed errors back to the LLM
+                error_feedback = "\n".join(
+                    f"- [{i.severity.upper()}] {i.message}"
+                    + (f" | Suggestion: {i.suggestion}" if i.suggestion else "")
+                    for i in score.issues if i.severity == "critical"
+                )
+                user_prompt = (
+                    f"The previous design had critical issues:\n"
+                    f"{error_feedback}\n\n"
+                    f"Please fix these issues and regenerate the complete "
+                    f"PCBDesign code. Original request: {request}"
+                )
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    f"Design attempt {attempt + 1}: {score.critical_count} "
+                    f"critical issues, retrying...",
+                    progress=0.04 + attempt * 0.02,
+                )
+
+            except Exception as e:
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    f"LLM attempt {attempt + 1} failed: {e}",
+                )
+                continue
 
         return None
 
     def _build_system_prompt(self) -> str:
-        templates = list_templates()
-        from ..components.footprints import list_footprints
+        from ..components.footprints import list_footprints, get_footprint
+
         footprints = list_footprints()
 
-        return f"""You are an expert PCB design engineer. Given a user's description of a
-PCB they want to create, generate Python code using the PCBDesign DSL.
+        # Build detailed footprint pin reference
+        fp_details = []
+        for fp_name in sorted(footprints):
+            fp = get_footprint(fp_name)
+            if fp:
+                pins = [p.number for p in fp.pads]
+                fp_details.append(f"  {fp_name}: pins {', '.join(pins)}")
 
-Available footprints: {', '.join(footprints)}
+        fp_reference = "\n".join(fp_details)
 
-Your output MUST be Python code that creates a board using this API:
+        # Get subcircuit library info if available
+        subcircuit_info = ""
+        try:
+            from .subcircuits import list_subcircuits
+            subcircuit_info = (
+                "\n\n## Available Subcircuit Functions\n\n"
+                "You can import and use these pre-built subcircuit functions:\n"
+                "```python\n"
+                "from ai_pcb_designer.ai.subcircuits import (\n"
+                "    usb_c_power, ldo_3v3, esp32_minimal,\n"
+                "    led_with_resistor, debug_header, mounting_holes_corners,\n"
+                "    # ... etc\n"
+                ")\n"
+                "```\n\n"
+                + list_subcircuits()
+            )
+        except ImportError:
+            pass
+
+        return f"""You are an expert PCB design engineer with deep knowledge of
+electronics, component selection, and PCB layout. You THINK DEEPLY
+about circuit design before writing code.
+
+Your task: given a user's PCB description, generate Python code that
+creates a complete, manufacturable board using the PCBDesign DSL.
+
+## PCBDesign DSL Reference
 
 ```python
 from ai_pcb_designer.ai.pcb_dsl import PCBDesign
 
 pcb = PCBDesign("Board Name", width=70.0, height=55.0, description="...")
 
-# Place components at specific positions
+# Place a component (returns PlacedComponent for net wiring)
 u1 = pcb.place("U1", "ESP32-WROOM-32", value="ESP32-WROOM-32",
                 pos=(35, 28), description="Main MCU")
 r1 = pcb.place("R1", "R_0603", value="10k", pos=(20, 15))
+c1 = pcb.place("C1", "C_0603", value="100nF", pos=(30, 30))
 
-# Define nets connecting component pins
-pcb.power_net("3V3", [(u1, "2"), (r1, "1")])  # Power net (wider trace)
+# Connect pins via nets
 pcb.net("SIGNAL", [(u1, "25"), (r1, "2")])     # Signal net
+pcb.power_net("3V3", [(u1, "2"), (c1, "1")])   # Power net (wider trace)
+pcb.power_net("GND", [(u1, "1"), (c1, "2")])   # Ground net
+
+# GPIO bus (wire IC pins to header pins)
+pcb.gpio_bus(u1, j1, {{"8": "1", "9": "2", "10": "3"}})
+
+# Silkscreen text
+pcb.text("My Board v1.0", pos=(35, 50), font_size=1.5)
 
 board = pcb.build()
 ```
 
-Rules:
-- Use standard reference designator prefixes (U, R, C, D, J, SW, H)
-- Always include decoupling capacitors within 3mm of IC power pins
-- Always include pull-up resistors for enable/reset pins
-- Place connectors at board edges, ICs centered, passives near their ICs
-- Board dimensions should fit all components with routing space
-- Use power_net() for GND, VCC, 3V3, 5V, VBUS
-- Every pin that needs connection must be in a net
-- Component positions must be inside the board boundaries
+## Available Footprints (with pin numbers)
 
-Output ONLY the Python code, no explanations.
+{fp_reference}
+
+## Key Pin Maps
+
+ESP32-WROOM-32 (39 pins):
+  1=GND, 2=3V3, 3=EN, 4=SENSOR_VP, 5=SENSOR_VN,
+  6=IO34, 7=IO35, 8=IO32, 9=IO33, 10=IO25,
+  11=IO26, 12=IO27, 13=IO14, 14=IO12, 15=GND,
+  16=IO13, 17=SHD/SD2, 18=SHD/SD3, 19=SCS/CMD,
+  20=SCK/CLK, 21=SDO/SD0, 22=SDI/SD1, 23=IO15,
+  24=IO2, 25=IO0, 26=IO4, 27=IO16, 28=IO17,
+  29=IO5, 30=IO18, 31=IO19, 32=NC, 33=IO21,
+  34=RXD0, 35=TXD0, 36=IO22, 37=IO23, 38=NC, 39=GND
+
+USB_C_16pin (24 pins):
+  A1=GND, A4=VBUS, A5=CC1, A6=D+, A7=D-,
+  A8=SBU1, A9=VBUS, A12=GND
+  B1=GND, B4=VBUS, B5=CC2, B6=D+, B7=D-,
+  B8=SBU2, B9=VBUS, B12=GND
+
+SOT-223 (LDO like AMS1117):
+  1=Input, 2=Ground, 3=Output
+
+SOT-23 (transistor/MOSFET):
+  1=Base/Gate, 2=Emitter/Source, 3=Collector/Drain
+
+WS2812B (addressable RGB LED):
+  1=VDD(5V), 2=DOUT, 3=GND, 4=DIN
+{subcircuit_info}
+
+## Design Rules (CRITICAL)
+
+1. EVERY IC must have at least one 100nF bypass cap within 5mm
+2. EVERY IC must be connected to power AND ground nets
+3. Use power_net() for GND, VCC, 3V3, 5V, VBUS (wider traces)
+4. Use net() for signal connections (standard traces)
+5. Place USB/barrel jack connectors at board edges (y < 15mm from top or x < 15mm from edge)
+6. ALL components must fit inside board boundaries with 5mm margin
+7. Space components at least 3mm apart to avoid overlaps
+8. Include pull-up resistors on EN/RESET pins (10k to 3V3)
+9. Include current-limiting resistors for LEDs (330-1k ohm)
+10. Include input AND output capacitors for voltage regulators
+11. Reference designator prefixes: U=IC, R=Resistor, C=Capacitor,
+    D=Diode/LED, J=Connector, SW=Switch, H=Mounting Hole, L=Inductor
+
+## Layout Guidelines
+
+- Board origin is top-left (0,0)
+- Connectors go at edges: USB at top center, headers on sides
+- Main IC centered: pos=(width/2, 25-35)
+- Support passives within 5mm of their IC
+- Power section near USB connector
+- Leave 5mm margin from all edges
+- For NxM LED matrices: 10mm pitch, serpentine data wiring
+
+Output ONLY the Python code, no explanations. The code MUST end with:
+board = pcb.build()
 """
 
     def _build_user_prompt(self, request: str) -> str:
-        return f"""Design a PCB based on this request:
+        return (
+            f"Design a complete, manufacturable PCB for this request:\n\n"
+            f"{request}\n\n"
+            f"Think carefully about:\n"
+            f"1. What components are needed (MCU, power, sensors, connectors)\n"
+            f"2. Proper power distribution (regulators, decoupling)\n"
+            f"3. Signal connections and pin assignments\n"
+            f"4. Physical layout and component spacing\n"
+            f"5. Board size that fits everything with routing room\n\n"
+            f"Generate complete Python code using the PCBDesign DSL.\n"
+            f"Include ALL necessary support components.\n"
+            f"Output ONLY the Python code."
+        )
 
-{request}
+    def _call_openai(self, system_prompt: str, user_prompt: str) -> str | None:
+        """Call OpenAI API. Supports thinking models (o3-mini, o4-mini).
 
-Generate Python code using the PCBDesign DSL. Include all necessary support
-components (decoupling caps, pull-up resistors, connectors, etc.).
-Output only the Python code."""
-
-    def _call_openai(self, system_prompt: str, user_prompt: str) -> Board | None:
+        Returns the raw response text (code), NOT a Board.
+        """
         try:
             import openai
         except ImportError:
+            self._emit(
+                AgentPhase.ANALYZING,
+                "openai package not installed. Run: pip install openai",
+            )
             return None
 
         client = openai.OpenAI(api_key=self.config.api_key)
-        response = client.chat.completions.create(
-            model=self.config.model or "gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
-        )
+        model = self.config.model or "o4-mini"
+
+        # Thinking models (o-series) don't support system messages or temperature
+        is_thinking_model = model.startswith("o")
+
+        if is_thinking_model:
+            messages = [
+                {"role": "user", "content": system_prompt + "\n\n" + user_prompt},
+            ]
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+            )
+        else:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+            )
 
         content = response.choices[0].message.content
-        if not content:
-            return None
+        return content if content else None
 
-        return self._execute_llm_code(content)
-
-    def _call_anthropic(self, system_prompt: str, user_prompt: str) -> Board | None:
+    def _call_anthropic(self, system_prompt: str, user_prompt: str) -> str | None:
+        """Call Anthropic API. Returns raw response text (code)."""
         try:
             import anthropic
         except ImportError:
+            self._emit(
+                AgentPhase.ANALYZING,
+                "anthropic package not installed. Run: pip install anthropic",
+            )
             return None
 
         client = anthropic.Anthropic(api_key=self.config.api_key)
         response = client.messages.create(
             model=self.config.model or "claude-sonnet-4-20250514",
-            max_tokens=4096,
+            max_tokens=8192,
             system=system_prompt,
             messages=[
                 {"role": "user", "content": user_prompt},
@@ -687,19 +866,14 @@ Output only the Python code."""
         )
 
         content = response.content[0].text
-        if not content:
-            return None
-
-        return self._execute_llm_code(content)
+        return content if content else None
 
     def _execute_llm_code(self, code: str) -> Board | None:
         """Execute Python DSL code generated by an LLM and return the Board.
 
         Extracts Python code from markdown fences if present, then executes
-        it in a clean namespace with the PCBDesign class available.  Looks
-        for a ``board`` variable (Board instance) or a ``pcb`` variable
-        (PCBDesign instance, calling ``.build()`` on it) in the resulting
-        namespace.
+        it in a clean namespace with the PCBDesign class and subcircuit
+        functions available.
 
         Returns the Board on success, or None on failure.
         """
@@ -713,18 +887,32 @@ Output only the Python code."""
         if fence_match:
             code = fence_match.group(1)
 
-        # Build a clean namespace with the DSL class available.
-        # The LLM code typically does `from ai_pcb_designer.ai.pcb_dsl import PCBDesign`
-        # which would fail inside exec, so we strip that import and inject
-        # the class directly.
+        # Strip import lines that would fail inside exec
         code = re.sub(
-            r"^\s*from\s+\S*pcb_dsl\s+import\s+.*$",
+            r"^\s*from\s+\S*(?:pcb_dsl|subcircuits)\s+import\s+.*$",
+            "",
+            code,
+            flags=re.MULTILINE,
+        )
+        code = re.sub(
+            r"^\s*import\s+\S*(?:pcb_dsl|subcircuits)\s*$",
             "",
             code,
             flags=re.MULTILINE,
         )
 
+        # Build namespace with DSL class and subcircuit functions
         namespace: dict[str, Any] = {"PCBDesign": PCBDesign}
+
+        # Inject subcircuit functions if available
+        try:
+            from . import subcircuits
+            for attr_name in dir(subcircuits):
+                obj = getattr(subcircuits, attr_name)
+                if callable(obj) and not attr_name.startswith("_"):
+                    namespace[attr_name] = obj
+        except ImportError:
+            pass
 
         try:
             exec(code, namespace)  # noqa: S102
@@ -732,7 +920,7 @@ Output only the Python code."""
             self._emit(
                 AgentPhase.ANALYZING,
                 f"LLM-generated code execution failed: {exc}",
-                detail=code,
+                detail=code[:500],
             )
             return None
 
@@ -747,14 +935,14 @@ Output only the Python code."""
                 self._emit(
                     AgentPhase.ANALYZING,
                     f"PCBDesign.build() failed: {exc}",
-                    detail=code,
+                    detail=code[:500],
                 )
                 return None
 
         self._emit(
             AgentPhase.ANALYZING,
             "LLM code did not produce a 'board' or 'pcb' variable",
-            detail=code,
+            detail=code[:300],
         )
         return None
 
