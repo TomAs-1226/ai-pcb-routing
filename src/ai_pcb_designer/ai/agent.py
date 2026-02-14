@@ -168,7 +168,7 @@ class PCBDesignAgent:
             board = self._create_custom_design(user_request)
 
             if board is None:
-                # Fallback: strict template match or default starter
+                # Fallback: strict template match
                 template_name = self._match_template(user_request)
                 if template_name:
                     self._emit(
@@ -178,9 +178,37 @@ class PCBDesignAgent:
                         progress=0.08,
                     )
                     board = create_board_from_template(template_name)
+                elif self.config.llm_provider not in ("template", ""):
+                    # LLM was explicitly selected but failed — try the
+                    # algorithmic DesignEngine one more time with the
+                    # raw request before giving up.
+                    self._emit(
+                        AgentPhase.SELECTING_COMPONENTS,
+                        "LLM and template matching failed. "
+                        "Attempting algorithmic design engine...",
+                        progress=0.07,
+                    )
+                    try:
+                        engine = DesignEngine()
+                        request_parsed = parse_request(user_request)
+                        pcb = engine.create_design(request_parsed)
+                        board = pcb.build()
+                    except Exception:
+                        board = None
+
+                    if board is None:
+                        self._emit(
+                            AgentPhase.SELECTING_COMPONENTS,
+                            "Could not generate a design for this request. "
+                            "Using a simple starter board — please try "
+                            "rephrasing with specific components.",
+                            progress=0.08,
+                        )
+                        board = create_board_from_template("led_blinker")
                 else:
                     self._emit(
                         AgentPhase.SELECTING_COMPONENTS,
+                        "No matching template found. "
                         "Using LED blinker as default starter board.",
                         progress=0.08,
                     )
@@ -746,7 +774,8 @@ class PCBDesignAgent:
         user_prompt = self._build_user_prompt(request)
 
         # Try up to 3 iterations: generate → validate → feedback → retry
-        last_code = ""
+        self._last_llm_code = ""
+        self._last_llm_error = ""
         for attempt in range(3):
             try:
                 if provider == "openai":
@@ -759,9 +788,33 @@ class PCBDesignAgent:
                 if not code:
                     return None
 
-                last_code = code
                 board = self._execute_llm_code(code)
                 if board is None:
+                    # Code execution failed — feed the error back to the
+                    # LLM so it can self-correct on the next attempt
+                    error_msg = getattr(self, "_last_llm_error", "unknown error")
+                    failed_code = getattr(self, "_last_llm_code", "")[:600]
+                    user_prompt = (
+                        f"Your previous code FAILED with this error:\n"
+                        f"  {error_msg}\n\n"
+                        f"The failing code was:\n```python\n{failed_code}\n```\n\n"
+                        f"IMPORTANT RULES:\n"
+                        f"- Use pcb.subcircuit('name', pos=(x,y)) to place subcircuits "
+                        f"(ldo_3v3, usb_c_power, esp32_minimal, etc.)\n"
+                        f"- Reference designators must be STRINGS: 'R1', 'C1', not R + 1\n"
+                        f"- Use pcb.place('ref', 'footprint', ...) for individual components\n"
+                        f"- Use pcb.net('name', [(comp, 'pin'), ...]) for signal nets\n"
+                        f"- Use pcb.power_net('name', [...]) for power nets (GND, 3V3, etc.)\n"
+                        f"- The code MUST end with: board = pcb.build()\n\n"
+                        f"Please fix the error and regenerate COMPLETE code.\n"
+                        f"Original request: {request}"
+                    )
+                    self._emit(
+                        AgentPhase.ANALYZING,
+                        f"Code attempt {attempt + 1} failed: {error_msg}. "
+                        f"Feeding error back to LLM...",
+                        progress=0.04 + attempt * 0.02,
+                    )
                     continue
 
                 # Validate the LLM-generated board
@@ -829,15 +882,21 @@ class PCBDesignAgent:
         try:
             from .subcircuits import list_subcircuits
             subcircuit_info = (
-                "\n\n## Available Subcircuit Functions\n\n"
-                "You can import and use these pre-built subcircuit functions:\n"
+                "\n\n## Subcircuit Convenience Method\n\n"
+                "Place pre-built subcircuits with `pcb.subcircuit()`:\n"
                 "```python\n"
-                "from ai_pcb_designer.ai.subcircuits import (\n"
-                "    usb_c_power, ldo_3v3, esp32_minimal,\n"
-                "    led_with_resistor, debug_header, mounting_holes_corners,\n"
-                "    relay_driver, i2c_sensor_breakout, spi_sensor_breakout,\n"
-                "    mosfet_switch, barrel_jack_power, h_bridge,\n"
-                ")\n"
+                "# Place subcircuits — ref_start is auto-managed, no imports needed\n"
+                "pwr = pcb.subcircuit('usb_c_power', pos=(35, 5))\n"
+                "ldo = pcb.subcircuit('ldo_3v3', pos=(55, 10))\n"
+                "mcu = pcb.subcircuit('esp32_minimal', pos=(35, 30))\n"
+                "led1 = pcb.subcircuit('led_with_resistor', pos=(60, 40), color='green')\n"
+                "dbg = pcb.subcircuit('debug_header', pos=(70, 50))\n"
+                "holes = pcb.subcircuit('mounting_holes_corners', pos=(0,0))  # uses board dims\n"
+                "\n"
+                "# Cross-wire subcircuit components via their returned dicts:\n"
+                "pcb.power_net('VBUS', [(pwr['usb'], 'A4'), (ldo['ldo'], '1')])\n"
+                "pcb.power_net('3V3', [(ldo['ldo'], '3'), (mcu['esp32'], '2')])\n"
+                "pcb.net('LED_GPIO', [(mcu['esp32'], '8'), (led1['resistor'], '1')])\n"
                 "```\n\n"
                 + list_subcircuits()
             )
@@ -1152,17 +1211,14 @@ board = pcb.build()
             )
             return None
 
-    def _execute_llm_code(self, code: str) -> Board | None:
-        """Execute Python DSL code generated by an LLM and return the Board.
+    def _sanitize_llm_code(self, code: str) -> str:
+        """Apply common fixes to LLM-generated Python code.
 
-        Extracts Python code from markdown fences if present, then executes
-        it in a clean namespace with the PCBDesign class and subcircuit
-        functions available.
-
-        Returns the Board on success, or None on failure.
+        LLMs frequently make predictable mistakes when writing DSL code.
+        This method patches the most common ones so more designs succeed
+        on the first attempt.
         """
         import re
-        from .pcb_dsl import PCBDesign
 
         # Extract code from ```python ... ``` fences if present
         fence_match = re.search(
@@ -1173,17 +1229,65 @@ board = pcb.build()
 
         # Strip import lines that would fail inside exec
         code = re.sub(
-            r"^\s*from\s+\S*(?:pcb_dsl|subcircuits)\s+import\s+.*$",
+            r"^\s*from\s+\S*(?:pcb_dsl|subcircuits|ai_pcb_designer)\s+import\s+.*$",
             "",
             code,
             flags=re.MULTILINE,
         )
         code = re.sub(
-            r"^\s*import\s+\S*(?:pcb_dsl|subcircuits)\s*$",
+            r"^\s*import\s+\S*(?:pcb_dsl|subcircuits|ai_pcb_designer)\s*$",
             "",
             code,
             flags=re.MULTILINE,
         )
+
+        # Fix string + int concatenation: "R" + ref_start → f"R{ref_start}"
+        # Common pattern: "X" + variable  →  "X" + str(variable)
+        code = re.sub(
+            r'("[A-Za-z_]+?")\s*\+\s*(\w+)',
+            r'\1 + str(\2)',
+            code,
+        )
+
+        # Fix f-string inside f-string issues: some LLMs double-format
+        # Nothing to do here for now
+
+        # Fix pcb.add_component(...) → pcb.place(...)
+        code = re.sub(
+            r'(\w+)\.add_component\s*\(',
+            r'\1.place(',
+            code,
+        )
+
+        # Fix pcb.add_net(...) → pcb.net(...)
+        code = re.sub(
+            r'(\w+)\.add_net\s*\(',
+            r'\1.net(',
+            code,
+        )
+
+        # Fix pcb.add_power_net(...) → pcb.power_net(...)
+        code = re.sub(
+            r'(\w+)\.add_power_net\s*\(',
+            r'\1.power_net(',
+            code,
+        )
+
+        return code
+
+    def _execute_llm_code(self, code: str) -> Board | None:
+        """Execute Python DSL code generated by an LLM and return the Board.
+
+        Extracts Python code from markdown fences if present, applies
+        common sanitization fixes, then executes it in a clean namespace
+        with the PCBDesign class and subcircuit functions available.
+
+        Returns the Board on success, or None on failure.
+        """
+        from .pcb_dsl import PCBDesign
+
+        code = self._sanitize_llm_code(code)
+        self._last_llm_code = code  # save for error feedback
 
         # Build namespace with DSL class and subcircuit functions
         namespace: dict[str, Any] = {"PCBDesign": PCBDesign}
@@ -1201,6 +1305,7 @@ board = pcb.build()
         try:
             exec(code, namespace)  # noqa: S102
         except Exception as exc:
+            self._last_llm_error = str(exc)
             self._emit(
                 AgentPhase.ANALYZING,
                 f"LLM-generated code execution failed: {exc}",
@@ -1216,6 +1321,7 @@ board = pcb.build()
             try:
                 return namespace["pcb"].build()
             except Exception as exc:
+                self._last_llm_error = str(exc)
                 self._emit(
                     AgentPhase.ANALYZING,
                     f"PCBDesign.build() failed: {exc}",
@@ -1223,6 +1329,7 @@ board = pcb.build()
                 )
                 return None
 
+        self._last_llm_error = "Code did not produce 'board' or 'pcb' variable"
         self._emit(
             AgentPhase.ANALYZING,
             "LLM code did not produce a 'board' or 'pcb' variable",

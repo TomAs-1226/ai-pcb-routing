@@ -83,6 +83,7 @@ class PCBDesign:
         self._components: list[PlacedComponent] = []
         self._nets: list[NetDef] = []
         self._texts: list[dict] = []
+        self._ref_counter: int = 100  # auto-incrementing ref start for subcircuits
         self._net_classes: dict[str, dict] = {
             "Default": {"trace_width": 0.25, "clearance": 0.2},
             "Power": {"trace_width": 0.5, "clearance": 0.25},
@@ -186,6 +187,60 @@ class PCBDesign:
             "trace_width": trace_width,
             "clearance": clearance,
         }
+
+    def subcircuit(
+        self,
+        name: str,
+        pos: tuple[float, float] = (0, 0),
+        ref_start: int | None = None,
+        **kwargs,
+    ) -> dict:
+        """Place a pre-built subcircuit on the board.
+
+        This is a convenience method that dispatches to the subcircuit
+        library.  The LLM can call e.g. ``pcb.subcircuit("ldo_3v3",
+        pos=(50, 10))`` without needing to import anything or manage
+        reference-designator numbering.
+
+        Args:
+            name: Subcircuit name (e.g. "ldo_3v3", "usb_c_power",
+                  "esp32_minimal").
+            pos: (x, y) placement position in mm.
+            ref_start: Starting reference number.  If ``None``, an
+                       auto-incrementing counter is used.
+            **kwargs: Extra keyword arguments forwarded to the subcircuit
+                      function (e.g. ``color="red"`` for ``led_with_resistor``).
+
+        Returns:
+            Dict of ``{symbolic_name: PlacedComponent}`` — keys depend
+            on the subcircuit.
+        """
+        from .subcircuits import SUBCIRCUIT_REGISTRY
+
+        entry = SUBCIRCUIT_REGISTRY.get(name)
+        if entry is None:
+            available = ", ".join(sorted(SUBCIRCUIT_REGISTRY.keys()))
+            raise ValueError(
+                f"Unknown subcircuit '{name}'. "
+                f"Available: {available}"
+            )
+
+        if ref_start is None:
+            ref_start = self._ref_counter
+            self._ref_counter += 20
+
+        func = entry[0]
+
+        # Special handling for mounting_holes_corners which takes
+        # board dimensions instead of pos
+        import inspect
+        sig = inspect.signature(func)
+        params = list(sig.parameters.keys())
+        if "board_width" in params and "board_height" in params:
+            return func(self, ref_start=ref_start,
+                        board_width=self.width, board_height=self.height,
+                        **kwargs)
+        return func(self, ref_start=ref_start, pos=pos, **kwargs)
 
     def text(
         self,

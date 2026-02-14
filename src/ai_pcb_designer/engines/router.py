@@ -483,6 +483,13 @@ class AutoRouter:
                     path.append(node)
                     node = came_from[node]
                 path.reverse()
+                # Extend path to the exact target grid position so the
+                # resulting trace segment terminates at the pad, not one
+                # cell away.  This prevents "partially routed" DRC errors.
+                target_layer = cl if el == -1 else el
+                last = path[-1]
+                if last[0] != ex or last[1] != ey:
+                    path.append((ex, ey, target_layer))
                 switches = [
                     (path[i][0], path[i][1])
                     for i in range(1, len(path))
