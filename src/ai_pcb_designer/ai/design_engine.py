@@ -26,14 +26,27 @@ class DesignRequest:
     mcu: str = "esp32"
     power: str = "usb-c"
     led_matrix: tuple[int, int] | None = None  # (cols, rows)
+    neopixel_strip: int = 0  # single-row strip count (0 = none)
     debug_header: bool = False
     gpio_header: bool = False
     gpio_count: int = 10
     i2c: bool = False
+    spi: bool = False
+    uart: bool = False
+    camera: bool = False  # FPC camera connector (24-pin)
+    display: str = ""  # "oled", "lcd", "tft", ""
+    sd_card: bool = False
+    motor_driver: bool = False
+    motor_count: int = 1
+    relay: bool = False
+    relay_count: int = 1
     sensors: list[str] = field(default_factory=list)
     leds: int = 0
+    buttons: int = 0
+    screw_terminals: int = 0
     logo_text: str = ""
     custom_text: str = ""
+    barrel_jack: bool = False
 
 
 # ─── Request Parser ─────────────────────────────────────────────────────────
@@ -97,8 +110,80 @@ def parse_request(text: str) -> DesignRequest:
     if "i2c" in low or "i²c" in low:
         req.i2c = True
 
+    # ── SPI ──────────────────────────────────────────────────────────────
+    if "spi" in low:
+        req.spi = True
+
+    # ── UART ─────────────────────────────────────────────────────────────
+    if "uart" in low or "serial" in low:
+        req.uart = True
+
+    # ── Camera ───────────────────────────────────────────────────────────
+    if "camera" in low or "ov2640" in low or "ov5640" in low or "cam" in low:
+        req.camera = True
+
+    # ── Display ──────────────────────────────────────────────────────────
+    if "oled" in low or "ssd1306" in low:
+        req.display = "oled"
+        req.i2c = True
+    elif "lcd" in low or "tft" in low or "display" in low or "screen" in low:
+        req.display = "lcd"
+        req.spi = True
+
+    # ── SD card ──────────────────────────────────────────────────────────
+    if "sd card" in low or "microsd" in low or "sd-card" in low or "sdcard" in low:
+        req.sd_card = True
+        req.spi = True
+
+    # ── Motor driver ─────────────────────────────────────────────────────
+    if "motor" in low or "h-bridge" in low or "h bridge" in low or "stepper" in low:
+        req.motor_driver = True
+        motor_cnt = re.search(r"(\d+)\s*motor", low)
+        if motor_cnt:
+            req.motor_count = max(1, min(4, int(motor_cnt.group(1))))
+
+    # ── Relay ────────────────────────────────────────────────────────────
+    if "relay" in low:
+        req.relay = True
+        relay_cnt = re.search(r"(\d+)\s*relay", low)
+        if relay_cnt:
+            req.relay_count = max(1, min(8, int(relay_cnt.group(1))))
+
+    # ── Barrel jack ──────────────────────────────────────────────────────
+    if "barrel" in low or "dc jack" in low or "power jack" in low:
+        req.barrel_jack = True
+
+    # ── Screw terminals ──────────────────────────────────────────────────
+    if "screw terminal" in low or "terminal block" in low:
+        req.screw_terminals = 2
+        term_cnt = re.search(r"(\d+)\s*(?:screw|terminal)", low)
+        if term_cnt:
+            req.screw_terminals = max(1, min(8, int(term_cnt.group(1))))
+
+    # ── Buttons ──────────────────────────────────────────────────────────
+    if "button" in low or "pushbutton" in low:
+        btn_cnt = re.search(r"(\d+)\s*(?:button|pushbutton)", low)
+        if btn_cnt:
+            req.buttons = max(1, min(8, int(btn_cnt.group(1))))
+        elif req.buttons == 0:
+            req.buttons = 1
+
+    # ── NeoPixel strip (not matrix) ──────────────────────────────────────
+    if req.led_matrix is None:
+        strip_pat = re.search(
+            r"(\d+)\s*(?:neo\s*pixel|ws2812|rgb\s*led|addressable)",
+            low,
+        )
+        if strip_pat:
+            cnt = int(strip_pat.group(1))
+            if cnt <= 32:
+                req.neopixel_strip = cnt
+
     # ── Sensors ──────────────────────────────────────────────────────────
-    known_sensors = ["bme280", "bmp280", "mpu6050", "dht22", "dht11", "sht30"]
+    known_sensors = [
+        "bme280", "bmp280", "mpu6050", "dht22", "dht11", "sht30",
+        "ina219", "ads1115", "max6675", "ds18b20", "hx711",
+    ]
     for s in known_sensors:
         if s in low:
             req.sensors.append(s)
@@ -106,10 +191,13 @@ def parse_request(text: str) -> DesignRequest:
     # ── Indicator LEDs ───────────────────────────────────────────────────
     led_count_match = re.search(r"(\d+)\s*(?:indicator|status)?\s*led", low)
     if led_count_match:
-        # Do not count the matrix size as indicator LEDs
-        if req.led_matrix is None or int(led_count_match.group(1)) <= 10:
-            req.leds = int(led_count_match.group(1))
-    elif "led" in low and req.led_matrix is None:
+        cnt = int(led_count_match.group(1))
+        # Do not count the matrix/strip size as indicator LEDs
+        if req.led_matrix is None and req.neopixel_strip == 0:
+            req.leds = min(cnt, 10)
+        elif cnt <= 4:
+            req.leds = cnt
+    elif "led" in low and req.led_matrix is None and req.neopixel_strip == 0:
         req.leds = 1
 
     # ── Logo / custom text ───────────────────────────────────────────────
@@ -156,19 +244,8 @@ class DesignEngine:
         self._ref_counters.clear()
         self._log.clear()
 
-        # ── Board size ───────────────────────────────────────────────
-        if request.led_matrix:
-            cols, rows = request.led_matrix
-            width = max(70, cols * 10 + 20)
-            height = max(55, 50 + rows * 10 + 15)
-            self._log.append(
-                f"Board sized for {cols}x{rows} LED matrix: "
-                f"{width}x{height}mm"
-            )
-        else:
-            width = 70
-            height = 55
-            self._log.append(f"Default board size: {width}x{height}mm")
+        # ── Board size (adaptive) ─────────────────────────────────────
+        width, height = self._estimate_board_size(request)
 
         pcb = PCBDesign(
             f"Custom {request.mcu.upper()} Board",
@@ -182,14 +259,35 @@ class DesignEngine:
         power_comps = self._add_power_section(pcb, request, cx)
 
         # ── MCU section ──────────────────────────────────────────────
-        mcu_comp = self._add_esp32_section(pcb, cx)
+        if request.mcu == "stm32":
+            mcu_comp = self._add_stm32_section(pcb, cx)
+        else:
+            mcu_comp = self._add_esp32_section(pcb, cx)
 
         # ── Wire power → MCU ─────────────────────────────────────────
         self._wire_power_to_mcu(pcb, power_comps, mcu_comp)
 
         # ── Debug header ─────────────────────────────────────────────
-        if request.debug_header:
+        if request.debug_header or request.uart:
             self._add_debug_header(pcb, mcu_comp, width)
+
+        # ── Camera connector ─────────────────────────────────────────
+        if request.camera:
+            self._add_camera_connector(pcb, mcu_comp, cx)
+
+        # ── Display connector ────────────────────────────────────────
+        if request.display:
+            self._add_display_connector(pcb, mcu_comp, request.display, cx)
+
+        # ── SD card ──────────────────────────────────────────────────
+        if request.sd_card:
+            self._add_sd_card(pcb, mcu_comp, width)
+
+        # ── Motor driver ─────────────────────────────────────────────
+        if request.motor_driver:
+            self._add_motor_driver(
+                pcb, mcu_comp, power_comps, request.motor_count, width,
+            )
 
         # ── NeoPixel LED matrix ──────────────────────────────────────
         if request.led_matrix:
@@ -197,9 +295,27 @@ class DesignEngine:
                 pcb, request.led_matrix, mcu_comp, cx, power_comps,
             )
 
+        # ── NeoPixel strip ───────────────────────────────────────────
+        if request.neopixel_strip > 0:
+            self._add_neopixel_strip(
+                pcb, request.neopixel_strip, mcu_comp, cx, power_comps,
+            )
+
+        # ── I2C pull-ups ─────────────────────────────────────────────
+        if request.i2c:
+            self._add_i2c_pullups(pcb, mcu_comp)
+
         # ── GPIO header ──────────────────────────────────────────────
         if request.gpio_header:
             self._add_gpio_header(pcb, mcu_comp, request.gpio_count)
+
+        # ── Extra buttons ────────────────────────────────────────────
+        if request.buttons > 0:
+            self._add_extra_buttons(pcb, mcu_comp, request.buttons, width)
+
+        # ── Screw terminals ──────────────────────────────────────────
+        if request.screw_terminals > 0:
+            self._add_screw_terminals(pcb, request.screw_terminals, width, height)
 
         # ── Indicator LEDs ───────────────────────────────────────────
         if request.leds > 0:
@@ -637,6 +753,397 @@ class DesignEngine:
             placed.append(led)
 
         self._log.append(f"Added {len(placed)} indicator LED(s) with resistors")
+        return placed
+
+    # ── Board Size Estimation ────────────────────────────────────────────
+
+    def _estimate_board_size(self, request: DesignRequest) -> tuple[float, float]:
+        """Compute board dimensions based on requested features."""
+        if request.led_matrix:
+            cols, rows = request.led_matrix
+            width = max(70, cols * 10 + 20)
+            height = max(55, 50 + rows * 10 + 15)
+            self._log.append(
+                f"Board sized for {cols}x{rows} LED matrix: "
+                f"{width}x{height}mm"
+            )
+            return width, height
+
+        # Base size
+        width = 70.0
+        height = 55.0
+
+        # Grow for features
+        if request.camera:
+            width = max(width, 80)
+            height = max(height, 65)
+        if request.display:
+            height += 15
+        if request.sd_card:
+            width = max(width, 80)
+        if request.motor_driver:
+            width = max(width, 85)
+            height = max(height, 65)
+        if request.neopixel_strip > 0:
+            width = max(width, request.neopixel_strip * 10 + 20)
+        if request.screw_terminals > 0:
+            width = max(width, request.screw_terminals * 8 + 40)
+
+        self._log.append(f"Board size: {width:.0f}x{height:.0f}mm")
+        return width, height
+
+    # ── STM32 Section ─────────────────────────────────────────────────────
+
+    def _add_stm32_section(
+        self,
+        pcb: PCBDesign,
+        cx: float,
+    ) -> PlacedComponent:
+        """Place an STM32 (QFP-48 placeholder) with bypass caps and reset."""
+        mcu_y = 28
+
+        stm = pcb.place(
+            self._next_ref("U"), "QFP-48",
+            value="STM32F103C8T6",
+            pos=(cx, mcu_y), description="Main MCU (STM32)",
+        )
+
+        cap1 = pcb.place(
+            self._next_ref("C"), "C_0603", value="100nF",
+            pos=(cx - 10, mcu_y + 10),
+            description="STM32 bypass cap 1",
+        )
+        cap2 = pcb.place(
+            self._next_ref("C"), "C_0603", value="100nF",
+            pos=(cx + 10, mcu_y + 10),
+            description="STM32 bypass cap 2",
+        )
+
+        r_rst = pcb.place(
+            self._next_ref("R"), "R_0603", value="10k",
+            pos=(cx - 14, mcu_y + 8),
+            description="NRST pull-up resistor",
+        )
+
+        btn_rst = pcb.place(
+            self._next_ref("SW"), "SW_Push_6mm", value="RESET",
+            pos=(cx - 20, mcu_y + 8),
+            description="Reset button",
+        )
+
+        # 3V3 → STM32 VDD + bypass caps + pull-up
+        pcb.power_net("3V3", [
+            (stm, "1"),  # VDD
+            (cap1, "1"), (cap2, "1"),
+            (r_rst, "1"),
+        ])
+        # GND
+        pcb.power_net("GND", [
+            (stm, "24"), (stm, "48"),  # VSS
+            (cap1, "2"), (cap2, "2"),
+            (btn_rst, "2"),
+        ])
+        # NRST
+        pcb.net("NRST", [
+            (stm, "7"),
+            (r_rst, "2"),
+            (btn_rst, "1"),
+        ])
+
+        self._log.append(
+            "STM32 section: QFP-48 + 2 bypass caps + reset circuit"
+        )
+        return stm
+
+    # ── Camera Connector ──────────────────────────────────────────────────
+
+    def _add_camera_connector(
+        self,
+        pcb: PCBDesign,
+        mcu: PlacedComponent,
+        cx: float,
+    ) -> PlacedComponent:
+        """Add a 24-pin FPC camera connector (e.g. OV2640) with wiring."""
+        cam = pcb.place(
+            self._next_ref("J"), "FPC_24pin", value="CAM_24P",
+            pos=(cx, 45), description="Camera FPC connector (OV2640)",
+        )
+
+        # Wire camera data pins to ESP32 GPIOs
+        # Typical OV2640: SIOD(SDA)=21, SIOC(SCL)=22, VSYNC=25, HREF=26,
+        # PCLK=27, XCLK=0, D0-D7 mapped to various GPIOs
+        pcb.power_net("3V3", [(cam, "1")])  # Camera VCC
+        pcb.power_net("GND", [(cam, "24")])  # Camera GND
+        # I2C for camera config (SCCB)
+        pcb.net("CAM_SDA", [(mcu, "33"), (cam, "2")])   # IO21
+        pcb.net("CAM_SCL", [(mcu, "36"), (cam, "3")])   # IO22
+        # Sync signals
+        pcb.net("CAM_VSYNC", [(mcu, "10"), (cam, "4")])  # IO25
+        pcb.net("CAM_HREF", [(mcu, "11"), (cam, "5")])   # IO26
+        pcb.net("CAM_PCLK", [(mcu, "12"), (cam, "6")])   # IO27
+        pcb.net("CAM_XCLK", [(mcu, "25"), (cam, "7")])   # IO0
+        # Data bus D0-D7
+        data_pins = [("8", "29"), ("9", "26"), ("10", "8"),
+                     ("11", "9"), ("12", "30"), ("13", "31"),
+                     ("14", "37"), ("15", "28")]
+        for cam_pin, mcu_pin in data_pins:
+            pcb.net(f"CAM_D{int(cam_pin)-8}", [(mcu, mcu_pin), (cam, cam_pin)])
+
+        self._log.append(
+            "Camera: 24-pin FPC connector wired to ESP32 camera interface"
+        )
+        return cam
+
+    # ── Display Connector ─────────────────────────────────────────────────
+
+    def _add_display_connector(
+        self,
+        pcb: PCBDesign,
+        mcu: PlacedComponent,
+        display_type: str,
+        cx: float,
+    ) -> PlacedComponent:
+        """Add a display module connector."""
+        if display_type == "oled":
+            # 4-pin I2C OLED header (SSD1306)
+            disp = pcb.place(
+                self._next_ref("J"), "PinHeader_1x04", value="OLED_SSD1306",
+                pos=(5, 35), description="I2C OLED display header",
+            )
+            pcb.power_net("GND", [(disp, "1")])
+            pcb.power_net("3V3", [(disp, "2")])
+            pcb.net("DISP_SCL", [(mcu, "36"), (disp, "3")])  # IO22=SCL
+            pcb.net("DISP_SDA", [(mcu, "33"), (disp, "4")])  # IO21=SDA
+            self._log.append("Display: I2C OLED (SSD1306) on left edge")
+        else:
+            # SPI LCD/TFT via 8-pin header
+            disp = pcb.place(
+                self._next_ref("J"), "PinHeader_1x08", value="LCD_SPI",
+                pos=(5, 35), description="SPI LCD/TFT display header",
+            )
+            pcb.power_net("3V3", [(disp, "1")])
+            pcb.power_net("GND", [(disp, "2")])
+            pcb.net("LCD_SCK", [(mcu, "30"), (disp, "3")])   # IO18
+            pcb.net("LCD_MOSI", [(mcu, "37"), (disp, "4")])  # IO23
+            pcb.net("LCD_CS", [(mcu, "29"), (disp, "5")])    # IO5
+            pcb.net("LCD_DC", [(mcu, "24"), (disp, "6")])    # IO2
+            pcb.net("LCD_RST", [(mcu, "26"), (disp, "7")])   # IO4
+            pcb.net("LCD_BL", [(mcu, "27"), (disp, "8")])    # IO16
+            self._log.append("Display: SPI LCD/TFT via 8-pin header on left edge")
+
+        return disp
+
+    # ── SD Card ───────────────────────────────────────────────────────────
+
+    def _add_sd_card(
+        self,
+        pcb: PCBDesign,
+        mcu: PlacedComponent,
+        board_width: float,
+    ) -> PlacedComponent:
+        """Add a MicroSD card socket wired via SPI."""
+        sd = pcb.place(
+            self._next_ref("J"), "MicroSD_Socket", value="MicroSD",
+            pos=(board_width - 10, 45),
+            description="MicroSD card socket",
+        )
+        # SD SPI mode: CLK=5, CMD(MOSI)=3, DAT0(MISO)=7, CS=DAT3=2
+        pcb.power_net("3V3", [(sd, "4")])      # VDD
+        pcb.power_net("GND", [(sd, "6")])      # VSS
+        pcb.net("SD_CLK", [(mcu, "30"), (sd, "5")])   # IO18 → CLK
+        pcb.net("SD_MOSI", [(mcu, "37"), (sd, "3")])  # IO23 → CMD
+        pcb.net("SD_MISO", [(mcu, "31"), (sd, "7")])  # IO19 → DAT0
+        pcb.net("SD_CS", [(mcu, "29"), (sd, "2")])    # IO5 → DAT3/CS
+
+        self._log.append("SD card: MicroSD socket (SPI mode) on right side")
+        return sd
+
+    # ── Motor Driver ──────────────────────────────────────────────────────
+
+    def _add_motor_driver(
+        self,
+        pcb: PCBDesign,
+        mcu: PlacedComponent,
+        power_comps: dict[str, PlacedComponent],
+        motor_count: int,
+        board_width: float,
+    ) -> list[PlacedComponent]:
+        """Add motor driver IC(s) with screw terminals for motor output."""
+        placed = []
+        y_base = 48
+
+        for i in range(min(motor_count, 2)):
+            x = board_width - 15 if i == 0 else board_width - 35
+            y = y_base
+
+            drv = pcb.place(
+                self._next_ref("U"), "SOIC-8", value="DRV8833",
+                pos=(x, y), description=f"Motor driver {i + 1}",
+            )
+
+            bypass = pcb.place(
+                self._next_ref("C"), "C_0805", value="100nF",
+                pos=(x + 6, y), description=f"Motor driver {i + 1} bypass",
+            )
+
+            term = pcb.place(
+                self._next_ref("J"), "ScrewTerminal_2P", value="MOTOR",
+                pos=(x, y + 10), description=f"Motor {i + 1} output",
+            )
+
+            # Power
+            pcb.power_net("VBUS", [(drv, "8")])  # VM (motor voltage)
+            pcb.power_net("GND", [(drv, "4"), (bypass, "2"), (term, "2")])
+            pcb.power_net("VBUS", [(bypass, "1")])
+
+            # Motor outputs
+            pcb.net(f"MOT{i}_A", [(drv, "3"), (term, "1")])
+            pcb.net(f"MOT{i}_B", [(drv, "6"), (term, "2")])
+
+            # Control pins from MCU
+            gpio_pins = [("13", "1"), ("14", "2")] if i == 0 else [("16", "1"), ("8", "2")]
+            for mcu_pin, drv_pin in gpio_pins:
+                pcb.net(f"MOT{i}_IN{drv_pin}", [(mcu, mcu_pin), (drv, drv_pin)])
+
+            placed.append(drv)
+
+        self._log.append(
+            f"Motor driver: {min(motor_count, 2)}x SOIC-8 (DRV8833) "
+            f"with screw terminals"
+        )
+        return placed
+
+    # ── NeoPixel Strip ────────────────────────────────────────────────────
+
+    def _add_neopixel_strip(
+        self,
+        pcb: PCBDesign,
+        count: int,
+        mcu: PlacedComponent,
+        cx: float,
+        power_comps: dict[str, PlacedComponent],
+    ) -> list[PlacedComponent]:
+        """Add a horizontal NeoPixel strip (single row)."""
+        pitch = 10.0
+        grid_w = (count - 1) * pitch
+        start_x = cx - grid_w / 2
+        y = 50  # below MCU area
+
+        leds: list[PlacedComponent] = []
+        for i in range(count):
+            led = pcb.place(
+                self._next_ref("D"), "WS2812B", value="WS2812B",
+                pos=(start_x + i * pitch, y),
+                description=f"NeoPixel {i + 1}",
+            )
+            leds.append(led)
+
+        # Power
+        vbus_pads = [(led, "1") for led in leds]
+        gnd_pads = [(led, "3") for led in leds]
+        pcb.power_net("VBUS", vbus_pads)
+        pcb.power_net("GND", gnd_pads)
+
+        # Data chain: MCU GPIO5 (pin 29) → first DIN
+        pcb.net("LED_DATA", [(mcu, "29"), (leds[0], "4")])
+        for i in range(len(leds) - 1):
+            pcb.net(f"LED_D{i}", [(leds[i], "2"), (leds[i + 1], "4")])
+
+        # Bulk cap
+        cap = pcb.place(
+            self._next_ref("C"), "C_0805", value="100uF",
+            pos=(start_x + grid_w + 8, y),
+            description="NeoPixel strip bulk cap",
+        )
+        pcb.power_net("VBUS", [(cap, "1")])
+        pcb.power_net("GND", [(cap, "2")])
+
+        self._log.append(
+            f"NeoPixel strip: {count} WS2812B LEDs, data from GPIO5"
+        )
+        return leds
+
+    # ── I2C Pull-ups ──────────────────────────────────────────────────────
+
+    def _add_i2c_pullups(
+        self,
+        pcb: PCBDesign,
+        mcu: PlacedComponent,
+    ) -> None:
+        """Add I2C SDA/SCL pull-up resistors (4.7k to 3V3)."""
+        r_sda = pcb.place(
+            self._next_ref("R"), "R_0603", value="4.7k",
+            pos=(10, 28), description="I2C SDA pull-up",
+        )
+        r_scl = pcb.place(
+            self._next_ref("R"), "R_0603", value="4.7k",
+            pos=(10, 32), description="I2C SCL pull-up",
+        )
+        pcb.power_net("3V3", [(r_sda, "1"), (r_scl, "1")])
+        pcb.net("I2C_SDA", [(mcu, "33"), (r_sda, "2")])  # IO21
+        pcb.net("I2C_SCL", [(mcu, "36"), (r_scl, "2")])  # IO22
+        self._log.append("I2C: 4.7k pull-ups on SDA/SCL (IO21/IO22)")
+
+    # ── Extra Buttons ─────────────────────────────────────────────────────
+
+    def _add_extra_buttons(
+        self,
+        pcb: PCBDesign,
+        mcu: PlacedComponent,
+        count: int,
+        board_width: float,
+    ) -> list[PlacedComponent]:
+        """Add user buttons with pull-ups."""
+        placed = []
+        gpio_pins = ["8", "9", "10", "11", "12", "13", "14", "16"]
+
+        for i in range(min(count, len(gpio_pins))):
+            x = board_width - 8
+            y = 30 + i * 8
+
+            btn = pcb.place(
+                self._next_ref("SW"), "SW_Push_6mm",
+                value=f"BTN{i + 1}",
+                pos=(x, y), description=f"User button {i + 1}",
+            )
+            r_pu = pcb.place(
+                self._next_ref("R"), "R_0603", value="10k",
+                pos=(x - 6, y), description=f"Button {i + 1} pull-up",
+            )
+
+            pcb.power_net("3V3", [(r_pu, "1")])
+            pcb.power_net("GND", [(btn, "2")])
+            pcb.net(f"BTN{i}", [(mcu, gpio_pins[i]), (r_pu, "2"), (btn, "1")])
+
+            placed.append(btn)
+
+        self._log.append(f"Added {len(placed)} user button(s) with pull-ups")
+        return placed
+
+    # ── Screw Terminals ───────────────────────────────────────────────────
+
+    def _add_screw_terminals(
+        self,
+        pcb: PCBDesign,
+        count: int,
+        board_width: float,
+        board_height: float,
+    ) -> list[PlacedComponent]:
+        """Add screw terminals along the bottom edge."""
+        placed = []
+        x_start = 15
+        pitch = 8.0
+
+        for i in range(min(count, 6)):
+            term = pcb.place(
+                self._next_ref("J"), "ScrewTerminal_2P",
+                value=f"TERM{i + 1}",
+                pos=(x_start + i * pitch, board_height - 8),
+                description=f"Screw terminal {i + 1}",
+            )
+            placed.append(term)
+
+        self._log.append(f"Added {len(placed)} screw terminal(s) at bottom edge")
         return placed
 
     # ── Mounting Holes ───────────────────────────────────────────────────

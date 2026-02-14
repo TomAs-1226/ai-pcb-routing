@@ -553,6 +553,218 @@ def ws2812b() -> Footprint:
     )
 
 
+# ─── FPC / FFC Connectors ─────────────────────────────────────────────────
+
+def fpc_24pin() -> Footprint:
+    """24-pin 0.5mm pitch FPC/FFC connector (common for camera modules like OV2640).
+
+    Pins: 1-24, bottom contact, SMD.
+    """
+    pads = []
+    pitch = 0.5
+    start_x = -((24 - 1) * pitch) / 2
+    for i in range(24):
+        pads.append(_smd_pad(str(i + 1), start_x + i * pitch, 0, 0.3, 1.0))
+    # Two mounting tabs
+    pads.append(_smd_pad("MP1", start_x - 1.5, 0, 1.0, 2.5))
+    pads.append(_smd_pad("MP2", -start_x + 1.5, 0, 1.0, 2.5))
+
+    w = 24 * pitch + 4
+    return Footprint(
+        name="FPC_24pin",
+        description="24-pin 0.5mm pitch FPC connector (camera)",
+        pads=pads,
+        silk_lines=[
+            SilkLine(Point(-w / 2, -2), Point(w / 2, -2)),
+            SilkLine(Point(w / 2, -2), Point(w / 2, 2)),
+            SilkLine(Point(w / 2, 2), Point(-w / 2, 2)),
+            SilkLine(Point(-w / 2, 2), Point(-w / 2, -2)),
+        ],
+        courtyard=CourtyardRect(Rect(-w / 2 - 0.5, -2.5, w + 1, 5)),
+    )
+
+
+def fpc_8pin() -> Footprint:
+    """8-pin 1mm pitch FPC connector (general purpose)."""
+    pads = []
+    pitch = 1.0
+    start_x = -((8 - 1) * pitch) / 2
+    for i in range(8):
+        pads.append(_smd_pad(str(i + 1), start_x + i * pitch, 0, 0.6, 1.5))
+    return Footprint(
+        name="FPC_8pin",
+        description="8-pin 1mm pitch FPC connector",
+        pads=pads,
+        courtyard=CourtyardRect(Rect(-6, -2, 12, 4)),
+    )
+
+
+def fpc_40pin() -> Footprint:
+    """40-pin 0.5mm pitch FPC connector (displays, camera ribbons)."""
+    pads = []
+    pitch = 0.5
+    start_x = -((40 - 1) * pitch) / 2
+    for i in range(40):
+        pads.append(_smd_pad(str(i + 1), start_x + i * pitch, 0, 0.3, 1.0))
+    pads.append(_smd_pad("MP1", start_x - 1.5, 0, 1.0, 2.5))
+    pads.append(_smd_pad("MP2", -start_x + 1.5, 0, 1.0, 2.5))
+    w = 40 * pitch + 4
+    return Footprint(
+        name="FPC_40pin",
+        description="40-pin 0.5mm pitch FPC connector (display/camera)",
+        pads=pads,
+        courtyard=CourtyardRect(Rect(-w / 2 - 0.5, -2.5, w + 1, 5)),
+    )
+
+
+# ─── SD Card ──────────────────────────────────────────────────────────────
+
+def micro_sd_socket() -> Footprint:
+    """MicroSD card socket (push-push type, SMD).
+
+    Standard pinout: 1=DAT2, 2=CD/DAT3, 3=CMD, 4=VDD,
+    5=CLK, 6=VSS, 7=DAT0, 8=DAT1, 9=CardDetect.
+    """
+    # Simplified: 9 signal pads along one edge + 2 mounting
+    pads = []
+    pitch = 1.1
+    start_x = -4 * pitch
+    for i in range(9):
+        pads.append(_smd_pad(str(i + 1), start_x + i * pitch, 0, 0.7, 1.5))
+    # Mounting tabs
+    pads.append(_smd_pad("MP1", -7, -5, 1.2, 1.5))
+    pads.append(_smd_pad("MP2", 7, -5, 1.2, 1.5))
+    return Footprint(
+        name="MicroSD_Socket",
+        description="MicroSD card socket (push-push, SMD)",
+        pads=pads,
+        silk_lines=[
+            SilkLine(Point(-7.5, -7), Point(7.5, -7)),
+            SilkLine(Point(7.5, -7), Point(7.5, 2)),
+            SilkLine(Point(7.5, 2), Point(-7.5, 2)),
+            SilkLine(Point(-7.5, 2), Point(-7.5, -7)),
+        ],
+        courtyard=CourtyardRect(Rect(-8, -7.5, 16, 10)),
+    )
+
+
+# ─── OLED / Display Module Headers ───────────────────────────────────────
+
+def oled_ssd1306_header() -> Footprint:
+    """4-pin I2C OLED module header (SSD1306 0.96").
+
+    Pins: 1=GND, 2=VCC, 3=SCL, 4=SDA.
+    """
+    return pin_header_1x(4)
+
+
+# ─── Motor Driver ─────────────────────────────────────────────────────────
+
+def qfp_48() -> Footprint:
+    """LQFP-48 package (7x7mm body, 0.5mm pitch).
+
+    Standard STM32F103C8T6 and similar MCU package.
+    Pins 1-12 on left, 13-24 on bottom, 25-36 on right, 37-48 on top.
+    """
+    pads = []
+    pitch = 0.5
+    # Left side: pins 1-12 (top to bottom)
+    for i in range(12):
+        pads.append(_smd_pad(str(i + 1), -4.5, -2.75 + i * pitch, 1.5, 0.3))
+    # Bottom side: pins 13-24 (left to right)
+    for i in range(12):
+        pads.append(_smd_pad(str(13 + i), -2.75 + i * pitch, 4.5, 0.3, 1.5))
+    # Right side: pins 25-36 (bottom to top)
+    for i in range(12):
+        pads.append(_smd_pad(str(25 + i), 4.5, 2.75 - i * pitch, 1.5, 0.3))
+    # Top side: pins 37-48 (right to left)
+    for i in range(12):
+        pads.append(_smd_pad(str(37 + i), 2.75 - i * pitch, -4.5, 0.3, 1.5))
+    return Footprint(
+        name="QFP-48",
+        description="LQFP-48 7x7mm 0.5mm pitch",
+        pads=pads,
+        silk_lines=[
+            SilkLine(Point(-3.5, -3.5), Point(3.5, -3.5)),
+            SilkLine(Point(3.5, -3.5), Point(3.5, 3.5)),
+            SilkLine(Point(3.5, 3.5), Point(-3.5, 3.5)),
+            SilkLine(Point(-3.5, 3.5), Point(-3.5, -3.5)),
+            SilkLine(Point(-3.5, -3.5), Point(-3, -3), 0.2),  # Pin 1 marker
+        ],
+        courtyard=CourtyardRect(Rect(-5.5, -5.5, 11, 11)),
+    )
+
+
+def soic_8() -> Footprint:
+    """SOIC-8 package (common for motor drivers, op-amps, etc.).
+
+    8 pads: 1-4 on one side, 5-8 on the other.
+    """
+    pads = []
+    pitch = 1.27
+    for i in range(4):
+        pads.append(_smd_pad(str(i + 1), -2.7, -1.905 + i * pitch, 1.5, 0.6))
+    for i in range(4):
+        pads.append(_smd_pad(str(8 - i), 2.7, -1.905 + i * pitch, 1.5, 0.6))
+    return Footprint(
+        name="SOIC-8",
+        description="SOIC-8 package",
+        pads=pads,
+        silk_lines=[
+            SilkLine(Point(-2, -2.5), Point(2, -2.5)),
+            SilkLine(Point(2, -2.5), Point(2, 2.5)),
+            SilkLine(Point(2, 2.5), Point(-2, 2.5)),
+            SilkLine(Point(-2, 2.5), Point(-2, -2.5)),
+            SilkLine(Point(-2, -2.5), Point(-1.5, -2), 0.2),  # Pin 1 marker
+        ],
+        courtyard=CourtyardRect(Rect(-3.7, -3, 7.4, 6)),
+    )
+
+
+# ─── Screw Terminal Blocks ────────────────────────────────────────────────
+
+def screw_terminal_2p() -> Footprint:
+    """2-position 5.08mm pitch screw terminal block."""
+    return Footprint(
+        name="ScrewTerminal_2P",
+        description="2-position 5.08mm pitch screw terminal",
+        pads=[
+            _tht_pad("1", -2.54, 0, 2.0, 1.2),
+            _tht_pad("2", 2.54, 0, 2.0, 1.2),
+        ],
+        courtyard=CourtyardRect(Rect(-5.5, -4, 11, 8)),
+    )
+
+
+def screw_terminal_3p() -> Footprint:
+    """3-position 5.08mm pitch screw terminal block."""
+    return Footprint(
+        name="ScrewTerminal_3P",
+        description="3-position 5.08mm pitch screw terminal",
+        pads=[
+            _tht_pad("1", -5.08, 0, 2.0, 1.2),
+            _tht_pad("2", 0, 0, 2.0, 1.2),
+            _tht_pad("3", 5.08, 0, 2.0, 1.2),
+        ],
+        courtyard=CourtyardRect(Rect(-8, -4, 16, 8)),
+    )
+
+
+# ─── Inductors ────────────────────────────────────────────────────────────
+
+def inductor_0805() -> Footprint:
+    """0805 inductor / ferrite bead."""
+    return Footprint(
+        name="L_0805",
+        description="0805 inductor",
+        pads=[
+            _smd_pad("1", -0.95, 0, 1.0, 1.2),
+            _smd_pad("2", 0.95, 0, 1.0, 1.2),
+        ],
+        courtyard=CourtyardRect(Rect(-1.7, -0.9, 3.4, 1.8)),
+    )
+
+
 # ─── Footprint Registry ────────────────────────────────────────────────────
 
 FOOTPRINT_REGISTRY: dict[str, callable] = {
@@ -596,6 +808,22 @@ FOOTPRINT_REGISTRY: dict[str, callable] = {
     "MountingHole_M2.5": mounting_hole_m2_5,
     # Addressable LEDs
     "WS2812B": ws2812b,
+    # FPC / FFC connectors
+    "FPC_8pin": fpc_8pin,
+    "FPC_24pin": fpc_24pin,
+    "FPC_40pin": fpc_40pin,
+    # SD card
+    "MicroSD_Socket": micro_sd_socket,
+    # Display
+    "OLED_SSD1306": oled_ssd1306_header,
+    # Motor driver / IC
+    "QFP-48": qfp_48,
+    "SOIC-8": soic_8,
+    # Screw terminals
+    "ScrewTerminal_2P": screw_terminal_2p,
+    "ScrewTerminal_3P": screw_terminal_3p,
+    # Inductors
+    "L_0805": inductor_0805,
 }
 
 

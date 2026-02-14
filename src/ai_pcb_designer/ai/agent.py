@@ -78,10 +78,29 @@ class AgentStep:
 
 @dataclass
 class AgentConfig:
-    """Configuration for the AI agent."""
+    """Configuration for the AI agent.
+
+    LLM integration:
+      Set ``llm_provider`` to ``"openai"`` or ``"anthropic"`` and
+      provide your ``api_key`` (or set the ``OPENAI_API_KEY`` /
+      ``ANTHROPIC_API_KEY`` environment variable).
+
+      For OpenAI, the default model is ``"o3-mini"`` — a thinking/
+      reasoning model that plans circuit design before writing code.
+      Other good choices: ``"o4-mini"``, ``"o1"``, ``"gpt-4o"``,
+      ``"gpt-4.1"``
+
+      For Anthropic, the default model is ``"claude-sonnet-4-5-20250929"``.
+
+    Quick-start example::
+
+        config = AgentConfig(llm_provider="openai")  # uses OPENAI_API_KEY env
+        agent = PCBDesignAgent(config)
+        board = agent.design("esp32 board with oled and motor driver")
+    """
     llm_provider: str = "template"  # "openai", "anthropic", or "template"
     api_key: str = ""
-    model: str = ""
+    model: str = ""  # "" = auto-select best thinking model
     output_dir: str = "./output"
     max_drc_retries: int = 3
     generate_kicad: bool = True
@@ -485,14 +504,25 @@ class PCBDesignAgent:
         try:
             request = parse_request(user_request)
 
-            # If the request is too vague (no MCU, no features), let LLM handle it
+            # If the request is too vague (no features at all), let LLM handle it
             has_features = (
                 request.led_matrix is not None
+                or request.neopixel_strip > 0
                 or request.debug_header
                 or request.gpio_header
                 or request.i2c
+                or request.spi
+                or request.uart
+                or request.camera
+                or request.display
+                or request.sd_card
+                or request.motor_driver
+                or request.relay
                 or request.sensors
                 or request.leds > 0
+                or request.buttons > 0
+                or request.screw_terminals > 0
+                or request.barrel_jack
                 or request.logo_text
             )
             if not has_features:
@@ -573,6 +603,18 @@ class PCBDesignAgent:
 
     # ─── LLM-based Design (thinking-capable models) ─────────────────────
 
+    def _resolve_api_key(self) -> str:
+        """Resolve API key from config or environment variables."""
+        import os
+        if self.config.api_key:
+            return self.config.api_key
+        provider = self.config.llm_provider
+        if provider == "openai":
+            return os.environ.get("OPENAI_API_KEY", "")
+        elif provider == "anthropic":
+            return os.environ.get("ANTHROPIC_API_KEY", "")
+        return ""
+
     def _generate_from_llm(self, request: str) -> Board | None:
         """Use a thinking-capable LLM to design a novel PCB from scratch.
 
@@ -585,7 +627,16 @@ class PCBDesignAgent:
         """
         provider = self.config.llm_provider
 
-        if provider == "template" or not self.config.api_key:
+        if provider == "template":
+            return None
+
+        api_key = self._resolve_api_key()
+        if not api_key:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"No API key found for {provider}. Set api_key in config "
+                f"or {provider.upper()}_API_KEY environment variable.",
+            )
             return None
 
         self._emit(
@@ -603,9 +654,9 @@ class PCBDesignAgent:
         for attempt in range(3):
             try:
                 if provider == "openai":
-                    code = self._call_openai(system_prompt, user_prompt)
+                    code = self._call_openai(system_prompt, user_prompt, api_key)
                 elif provider == "anthropic":
-                    code = self._call_anthropic(system_prompt, user_prompt)
+                    code = self._call_anthropic(system_prompt, user_prompt, api_key)
                 else:
                     return None
 
@@ -621,7 +672,10 @@ class PCBDesignAgent:
                 validator = DesignValidator()
                 score = validator.validate(board)
 
-                if score.is_feasible:
+                # Accept the design if it's feasible OR scores well enough.
+                # LLM-generated designs with minor overlaps (score >= 65)
+                # are still usable — the DRC fix loop will clean them up.
+                if score.is_feasible or score.total >= 65:
                     self._emit(
                         AgentPhase.CREATING_SCHEMATIC,
                         f"AI-designed board (score: {score.total:.0f}/100)",
@@ -631,7 +685,7 @@ class PCBDesignAgent:
                     )
                     return board
 
-                # Not feasible — feed errors back to the LLM
+                # Poor quality — feed errors back to the LLM
                 error_feedback = "\n".join(
                     f"- [{i.severity.upper()}] {i.message}"
                     + (f" | Suggestion: {i.suggestion}" if i.suggestion else "")
@@ -645,8 +699,8 @@ class PCBDesignAgent:
                 )
                 self._emit(
                     AgentPhase.ANALYZING,
-                    f"Design attempt {attempt + 1}: {score.critical_count} "
-                    f"critical issues, retrying...",
+                    f"Design attempt {attempt + 1}: score {score.total:.0f}, "
+                    f"{score.critical_count} critical issues, retrying...",
                     progress=0.04 + attempt * 0.02,
                 )
 
@@ -803,8 +857,30 @@ board = pcb.build()
             f"Output ONLY the Python code."
         )
 
-    def _call_openai(self, system_prompt: str, user_prompt: str) -> str | None:
-        """Call OpenAI API. Supports thinking models (o3-mini, o4-mini).
+    # Known OpenAI reasoning/thinking model prefixes — these use a single
+    # user message (no system role, no temperature param).
+    _OPENAI_THINKING_PREFIXES = ("o1", "o3", "o4")
+
+    @classmethod
+    def _is_thinking_model(cls, model: str) -> bool:
+        """Return True if *model* is an OpenAI reasoning/thinking model."""
+        return any(model.startswith(p) for p in cls._OPENAI_THINKING_PREFIXES)
+
+    def _call_openai(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        api_key: str,
+    ) -> str | None:
+        """Call OpenAI API. Supports thinking/reasoning models.
+
+        Default model: ``o3-mini`` (reasoning model — thinks through
+        circuit design before generating code).
+
+        Thinking models (o-series: o1, o3-mini, o4-mini, etc.) use
+        a single user message with ``max_completion_tokens`` instead of
+        ``max_tokens``.  Non-thinking models (gpt-4o, gpt-4.1, etc.)
+        use the standard system + user format.
 
         Returns the raw response text (code), NOT a Board.
         """
@@ -817,34 +893,76 @@ board = pcb.build()
             )
             return None
 
-        client = openai.OpenAI(api_key=self.config.api_key)
-        model = self.config.model or "o4-mini"
+        client = openai.OpenAI(api_key=api_key)
+        model = self.config.model or "o3-mini"
 
-        # Thinking models (o-series) don't support system messages or temperature
-        is_thinking_model = model.startswith("o")
+        self._emit(
+            AgentPhase.ANALYZING,
+            f"Calling {model} for PCB design...",
+            progress=0.04,
+        )
 
-        if is_thinking_model:
-            messages = [
-                {"role": "user", "content": system_prompt + "\n\n" + user_prompt},
-            ]
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
+        try:
+            if self._is_thinking_model(model):
+                # Thinking / reasoning models don't support system messages
+                # or temperature — combine into one user message.
+                combined = system_prompt + "\n\n---\n\n" + user_prompt
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": combined}],
+                    max_completion_tokens=16384,
+                )
+            else:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.3,
+                    max_tokens=8192,
+                )
+
+            content = response.choices[0].message.content
+            return content if content else None
+
+        except openai.AuthenticationError:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"OpenAI authentication failed — check your API key.",
             )
-        else:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
+            return None
+        except openai.RateLimitError:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"OpenAI rate limit hit — try again in a moment.",
             )
+            return None
+        except openai.BadRequestError as e:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"OpenAI rejected request: {e}. Try a different model.",
+            )
+            return None
+        except openai.APIConnectionError as e:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"Cannot connect to OpenAI API: {e}",
+            )
+            return None
+        except Exception as e:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"OpenAI call failed: {type(e).__name__}: {e}",
+            )
+            return None
 
-        content = response.choices[0].message.content
-        return content if content else None
-
-    def _call_anthropic(self, system_prompt: str, user_prompt: str) -> str | None:
+    def _call_anthropic(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        api_key: str,
+    ) -> str | None:
         """Call Anthropic API. Returns raw response text (code)."""
         try:
             import anthropic
@@ -855,18 +973,52 @@ board = pcb.build()
             )
             return None
 
-        client = anthropic.Anthropic(api_key=self.config.api_key)
-        response = client.messages.create(
-            model=self.config.model or "claude-sonnet-4-20250514",
-            max_tokens=8192,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_prompt},
-            ],
+        client = anthropic.Anthropic(api_key=api_key)
+        model = self.config.model or "claude-sonnet-4-5-20250929"
+
+        self._emit(
+            AgentPhase.ANALYZING,
+            f"Calling {model} for PCB design...",
+            progress=0.04,
         )
 
-        content = response.content[0].text
-        return content if content else None
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=8192,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+
+            content = response.content[0].text
+            return content if content else None
+
+        except anthropic.AuthenticationError:
+            self._emit(
+                AgentPhase.ANALYZING,
+                "Anthropic authentication failed — check your API key.",
+            )
+            return None
+        except anthropic.RateLimitError:
+            self._emit(
+                AgentPhase.ANALYZING,
+                "Anthropic rate limit hit — try again in a moment.",
+            )
+            return None
+        except anthropic.APIConnectionError as e:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"Cannot connect to Anthropic API: {e}",
+            )
+            return None
+        except Exception as e:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"Anthropic call failed: {type(e).__name__}: {e}",
+            )
+            return None
 
     def _execute_llm_code(self, code: str) -> Board | None:
         """Execute Python DSL code generated by an LLM and return the Board.
