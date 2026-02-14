@@ -765,6 +765,179 @@ def inductor_0805() -> Footprint:
     )
 
 
+# ─── Barrel Jack / DC Power ─────────────────────────────────────────────
+
+def barrel_jack_dc() -> Footprint:
+    """Standard 2.1 mm barrel jack (through-hole, 3 pins).
+
+    Pin 1 = tip (positive), Pin 2 = sleeve (GND), Pin 3 = switch (NC).
+    """
+    return Footprint(
+        name="BarrelJack_DC",
+        description="DC barrel jack 2.1mm THT",
+        pads=[
+            _tht_pad("1", 0, 0, 2.0, 1.0),       # tip (VIN)
+            _tht_pad("2", -6.0, 0, 2.0, 1.0),     # sleeve (GND)
+            _tht_pad("3", -3.0, 4.7, 2.0, 1.0),   # switch
+        ],
+        silk_lines=[
+            SilkLine(Point(-8, -4), Point(2, -4)),
+            SilkLine(Point(2, -4), Point(2, 6)),
+            SilkLine(Point(2, 6), Point(-8, 6)),
+            SilkLine(Point(-8, 6), Point(-8, -4)),
+        ],
+        courtyard=CourtyardRect(Rect(-9, -5, 12, 12)),
+    )
+
+
+# ─── Relay (SRD / SRS style) ────────────────────────────────────────────
+
+def relay_spdt() -> Footprint:
+    """5V SPDT relay (SRD-05VDC-SL-C style).
+
+    Pins: 1 = coil +, 2 = coil –, 3 = COM, 4 = NO, 5 = NC.
+    """
+    return Footprint(
+        name="Relay_SPDT",
+        description="SPDT relay (SRD-05VDC style)",
+        pads=[
+            _tht_pad("1", -7.5, -5.0, 2.0, 1.0),   # coil +
+            _tht_pad("2", 7.5, -5.0, 2.0, 1.0),    # coil −
+            _tht_pad("3", -5.0, 5.0, 2.0, 1.0),    # COM
+            _tht_pad("4", 0.0, 5.0, 2.0, 1.0),     # NO
+            _tht_pad("5", 5.0, 5.0, 2.0, 1.0),     # NC
+        ],
+        silk_lines=[
+            SilkLine(Point(-10, -7), Point(10, -7)),
+            SilkLine(Point(10, -7), Point(10, 7)),
+            SilkLine(Point(10, 7), Point(-10, 7)),
+            SilkLine(Point(-10, 7), Point(-10, -7)),
+        ],
+        courtyard=CourtyardRect(Rect(-11, -8, 22, 16)),
+    )
+
+
+# ─── DPAK / TO-252 MOSFET ───────────────────────────────────────────────
+
+def dpak_to252() -> Footprint:
+    """DPAK / TO-252 power MOSFET (3 pins: gate, drain tab, source)."""
+    return Footprint(
+        name="DPAK_TO252",
+        description="DPAK / TO-252 power package",
+        pads=[
+            _smd_pad("1", -2.3, 3.4, 1.0, 1.4),    # gate
+            _smd_pad("2", 0, -1.0, 6.5, 6.5),       # drain (exposed pad)
+            _smd_pad("3", 2.3, 3.4, 1.0, 1.4),      # source
+        ],
+        silk_lines=[
+            SilkLine(Point(-3.5, -4.5), Point(3.5, -4.5)),
+            SilkLine(Point(3.5, -4.5), Point(3.5, 4.5)),
+            SilkLine(Point(3.5, 4.5), Point(-3.5, 4.5)),
+            SilkLine(Point(-3.5, 4.5), Point(-3.5, -4.5)),
+        ],
+        courtyard=CourtyardRect(Rect(-4.5, -5.5, 9, 11)),
+    )
+
+
+# ─── SOT-89 ─────────────────────────────────────────────────────────────
+
+def sot89() -> Footprint:
+    """SOT-89 package (common for LDO regulators and transistors)."""
+    return Footprint(
+        name="SOT-89",
+        description="SOT-89 package",
+        pads=[
+            _smd_pad("1", -1.5, 1.8, 0.7, 1.0),
+            _smd_pad("2", 0, -1.5, 1.5, 2.0),  # collector/drain tab
+            _smd_pad("3", 1.5, 1.8, 0.7, 1.0),
+        ],
+        courtyard=CourtyardRect(Rect(-2.5, -3, 5, 6)),
+    )
+
+
+# ─── DIP-8 ──────────────────────────────────────────────────────────────
+
+def dip_8() -> Footprint:
+    """DIP-8 through-hole IC package (op-amps, timers, etc.)."""
+    pads = []
+    pitch = 2.54
+    for i in range(4):
+        pads.append(_tht_pad(str(i + 1), -3.81, -3.81 + i * pitch, 1.6, 0.8))
+    for i in range(4):
+        pads.append(_tht_pad(str(8 - i), 3.81, -3.81 + i * pitch, 1.6, 0.8))
+    return Footprint(
+        name="DIP-8",
+        description="DIP-8 through-hole IC",
+        pads=pads,
+        silk_lines=[
+            SilkLine(Point(-3, -5.5), Point(3, -5.5)),
+            SilkLine(Point(3, -5.5), Point(3, 5.5)),
+            SilkLine(Point(3, 5.5), Point(-3, 5.5)),
+            SilkLine(Point(-3, 5.5), Point(-3, -5.5)),
+            SilkLine(Point(-0.5, -5.5), Point(0.5, -5.5), 0.2),  # notch
+        ],
+        courtyard=CourtyardRect(Rect(-5.5, -6.5, 11, 13)),
+    )
+
+
+# ─── TO-220 ─────────────────────────────────────────────────────────────
+
+def to_220() -> Footprint:
+    """TO-220 through-hole power package (regulators, MOSFETs)."""
+    return Footprint(
+        name="TO-220",
+        description="TO-220 power package",
+        pads=[
+            _tht_pad("1", -2.54, 0, 2.0, 1.0),
+            _tht_pad("2", 0, 0, 2.0, 1.0),
+            _tht_pad("3", 2.54, 0, 2.0, 1.0),
+        ],
+        silk_lines=[
+            SilkLine(Point(-5, -3), Point(5, -3)),
+            SilkLine(Point(5, -3), Point(5, 3)),
+            SilkLine(Point(5, 3), Point(-5, 3)),
+            SilkLine(Point(-5, 3), Point(-5, -3)),
+        ],
+        courtyard=CourtyardRect(Rect(-6, -4, 12, 8)),
+    )
+
+
+# ─── Sensor / Breakout Headers ──────────────────────────────────────────
+
+def sensor_header_4pin() -> Footprint:
+    """4-pin I2C sensor breakout header (VCC, GND, SDA, SCL).
+
+    Common for BME280, BMP280, SHT31, AHT20, etc.
+    """
+    return pin_header_1x(4)
+
+
+def sensor_header_6pin() -> Footprint:
+    """6-pin SPI sensor breakout header (VCC, GND, SCK, MOSI, MISO, CS).
+
+    Common for BME280-SPI, MPU6050, ADXL345, etc.
+    """
+    return pin_header_1x(6)
+
+
+# ─── Diode / TVS ────────────────────────────────────────────────────────
+
+def diode_sod123() -> Footprint:
+    """SOD-123 SMD diode package (flyback, Schottky, TVS)."""
+    return Footprint(
+        name="SOD-123",
+        description="SOD-123 diode",
+        pads=[
+            _smd_pad("K", -1.35, 0, 0.9, 0.9),   # cathode
+            _smd_pad("A", 1.35, 0, 0.9, 0.9),     # anode
+        ],
+        silk_lines=[
+            SilkLine(Point(-0.3, -0.5), Point(-0.3, 0.5)),  # cathode bar
+        ],
+        courtyard=CourtyardRect(Rect(-2.1, -0.7, 4.2, 1.4)),
+    )
+
+
 # ─── Footprint Registry ────────────────────────────────────────────────────
 
 FOOTPRINT_REGISTRY: dict[str, callable] = {
@@ -824,6 +997,21 @@ FOOTPRINT_REGISTRY: dict[str, callable] = {
     "ScrewTerminal_3P": screw_terminal_3p,
     # Inductors
     "L_0805": inductor_0805,
+    # Power connectors
+    "BarrelJack_DC": barrel_jack_dc,
+    # Relays
+    "Relay_SPDT": relay_spdt,
+    # Power packages
+    "DPAK_TO252": dpak_to252,
+    "SOT-89": sot89,
+    "TO-220": to_220,
+    # Through-hole ICs
+    "DIP-8": dip_8,
+    # Sensor breakout headers
+    "Sensor_I2C_4pin": sensor_header_4pin,
+    "Sensor_SPI_6pin": sensor_header_6pin,
+    # Diodes
+    "SOD-123": diode_sod123,
 }
 
 

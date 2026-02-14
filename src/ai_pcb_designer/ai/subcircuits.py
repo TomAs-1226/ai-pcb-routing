@@ -1125,15 +1125,13 @@ def barrel_jack_power(
     """
     x, y = pos
 
-    # Use PinHeader_1x03 as a barrel-jack placeholder since the
-    # Barrel_Jack footprint is not in the registry.
     jack = pcb.place(
-        _ref("J", ref_start), "PinHeader_1x03", value="Barrel_Jack",
-        pos=(x, y), description="Barrel jack power connector (placeholder)",
+        _ref("J", ref_start), "BarrelJack_DC", value="Barrel_Jack",
+        pos=(x, y), description="DC barrel jack power connector",
     )
     diode = pcb.place(
-        _ref("D", ref_start, 1), "LED_0805", value="1N5819",
-        pos=(x + 6, y), description="Polarity protection diode",
+        _ref("D", ref_start, 1), "SOD-123", value="1N5819",
+        pos=(x + 6, y), description="Polarity protection Schottky diode",
     )
     c_filter = pcb.place(
         _ref("C", ref_start, 2), "C_0805", value="100uF",
@@ -1141,15 +1139,221 @@ def barrel_jack_power(
     )
 
     # Barrel tip to diode anode
-    pcb.net("JACK_TIP", [(jack, "1"), (diode, "1")])
+    pcb.net("JACK_TIP", [(jack, "1"), (diode, "A")])
 
     # Diode cathode to VIN rail
-    pcb.power_net("VIN", [(diode, "2"), (c_filter, "1")])
+    pcb.power_net("VIN", [(diode, "K"), (c_filter, "1")])
 
     # Barrel sleeve and cap to GND
     pcb.power_net("GND", [(jack, "2"), (c_filter, "2")])
 
     return {"jack": jack, "diode": diode, "c_filter": c_filter}
+
+
+# ---------------------------------------------------------------------------
+# 21. Relay Driver
+# ---------------------------------------------------------------------------
+
+def relay_driver(
+    pcb: PCBDesign,
+    ref_start: int,
+    pos: tuple[float, float],
+    gpio_net: str = "RELAY_CTRL",
+) -> dict[str, PlacedComponent]:
+    """Relay with NPN transistor driver and flyback diode.
+
+    Drives an SPDT relay from a GPIO pin via a SOT-23-3 NPN transistor.
+    Includes a flyback diode across the coil for back-EMF protection
+    and a base resistor for the transistor.
+
+    Relay pinout: 1=coil+, 2=coil-, 3=COM, 4=NO, 5=NC.
+
+    Internal nets wired:
+        - ``5V`` or ``VBUS`` (power) on relay coil+
+        - ``GND`` (power) on transistor emitter
+        - ``gpio_net`` (signal) on base resistor
+
+    Returned keys:
+        ``relay``, ``transistor``, ``diode``, ``r_base``
+    """
+    x, y = pos
+
+    relay = pcb.place(
+        _ref("K", ref_start), "Relay_SPDT", value="SRD-05VDC",
+        pos=(x, y), description="5V SPDT relay",
+    )
+    transistor = pcb.place(
+        _ref("Q", ref_start, 1), "SOT-23-3", value="2N2222",
+        pos=(x, y + 12), description="NPN relay driver",
+    )
+    diode = pcb.place(
+        _ref("D", ref_start, 2), "SOD-123", value="1N4148",
+        pos=(x + 8, y), description="Flyback diode",
+    )
+    r_base = pcb.place(
+        _ref("R", ref_start, 3), "R_0603", value="1k",
+        pos=(x - 3, y + 12), description="Base resistor",
+    )
+
+    # Coil+ to supply, coil- to transistor collector
+    pcb.power_net("VBUS", [(relay, "1"), (diode, "K")])
+    pcb.net("RELAY_COIL", [(relay, "2"), (transistor, "3"), (diode, "A")])
+
+    # Transistor emitter to GND
+    pcb.power_net("GND", [(transistor, "2")])
+
+    # GPIO drives base through resistor
+    pcb.net(gpio_net, [(r_base, "1")])
+    pcb.net(f"{gpio_net}_BASE", [(r_base, "2"), (transistor, "1")])
+
+    return {
+        "relay": relay, "transistor": transistor,
+        "diode": diode, "r_base": r_base,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 22. I2C Sensor Breakout
+# ---------------------------------------------------------------------------
+
+def i2c_sensor_breakout(
+    pcb: PCBDesign,
+    ref_start: int,
+    pos: tuple[float, float],
+    sensor_name: str = "BME280",
+    with_pullups: bool = True,
+) -> dict[str, PlacedComponent]:
+    """Generic I2C sensor breakout header with optional pull-ups.
+
+    A 4-pin header (VCC, GND, SDA, SCL) for connecting any I2C
+    sensor module.  Optionally adds 4.7k pull-up resistors for
+    SDA and SCL.
+
+    Internal nets wired:
+        - ``3V3`` (power) on header pin 1 and pull-up tops
+        - ``GND`` (power) on header pin 2
+        - ``I2C_SDA``, ``I2C_SCL`` (signal) on header pins 3-4
+
+    Returned keys:
+        ``header``, and optionally ``r_sda``, ``r_scl``
+    """
+    x, y = pos
+
+    header = pcb.place(
+        _ref("J", ref_start), "Sensor_I2C_4pin", value=sensor_name,
+        pos=(x, y), description=f"I2C sensor header ({sensor_name})",
+    )
+
+    result: dict[str, PlacedComponent] = {"header": header}
+
+    pcb.power_net("3V3", [(header, "1")])
+    pcb.power_net("GND", [(header, "2")])
+
+    sda_pads: list = [(header, "3")]
+    scl_pads: list = [(header, "4")]
+
+    if with_pullups:
+        r_sda = pcb.place(
+            _ref("R", ref_start, 1), "R_0603", value="4.7k",
+            pos=(x + 4, y), description="I2C SDA pull-up",
+        )
+        r_scl = pcb.place(
+            _ref("R", ref_start, 2), "R_0603", value="4.7k",
+            pos=(x + 4, y + 3), description="I2C SCL pull-up",
+        )
+        pcb.power_net("3V3", [(r_sda, "1"), (r_scl, "1")])
+        sda_pads.append((r_sda, "2"))
+        scl_pads.append((r_scl, "2"))
+        result["r_sda"] = r_sda
+        result["r_scl"] = r_scl
+
+    pcb.net("I2C_SDA", sda_pads)
+    pcb.net("I2C_SCL", scl_pads)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 23. SPI Sensor Breakout
+# ---------------------------------------------------------------------------
+
+def spi_sensor_breakout(
+    pcb: PCBDesign,
+    ref_start: int,
+    pos: tuple[float, float],
+    sensor_name: str = "ADXL345",
+) -> dict[str, PlacedComponent]:
+    """Generic SPI sensor breakout header.
+
+    A 6-pin header (VCC, GND, SCK, MOSI, MISO, CS) for any SPI
+    sensor module.
+
+    Internal nets wired:
+        - ``3V3`` on pin 1, ``GND`` on pin 2
+        - ``SPI_SCK``, ``SPI_MOSI``, ``SPI_MISO``, ``SPI_CS``
+
+    Returned keys: ``header``
+    """
+    x, y = pos
+
+    header = pcb.place(
+        _ref("J", ref_start), "Sensor_SPI_6pin", value=sensor_name,
+        pos=(x, y), description=f"SPI sensor header ({sensor_name})",
+    )
+
+    pcb.power_net("3V3", [(header, "1")])
+    pcb.power_net("GND", [(header, "2")])
+    pcb.net("SPI_SCK", [(header, "3")])
+    pcb.net("SPI_MOSI", [(header, "4")])
+    pcb.net("SPI_MISO", [(header, "5")])
+    pcb.net("SPI_CS", [(header, "6")])
+
+    return {"header": header}
+
+
+# ---------------------------------------------------------------------------
+# 24. MOSFET Switch
+# ---------------------------------------------------------------------------
+
+def mosfet_switch(
+    pcb: PCBDesign,
+    ref_start: int,
+    pos: tuple[float, float],
+    gpio_net: str = "FET_CTRL",
+) -> dict[str, PlacedComponent]:
+    """N-channel MOSFET low-side switch with gate resistor.
+
+    Drives a load (connected between LOAD+ and drain) from a GPIO pin
+    via a SOT-23-3 N-FET.  Includes a gate pull-down resistor to
+    keep the FET off when the GPIO is floating.
+
+    Internal nets wired:
+        - ``GND`` on source
+        - ``gpio_net`` on gate resistor input
+
+    Returned keys: ``mosfet``, ``r_gate``, ``r_pulldown``
+    """
+    x, y = pos
+
+    mosfet = pcb.place(
+        _ref("Q", ref_start), "SOT-23-3", value="2N7002",
+        pos=(x, y), description="N-channel MOSFET switch",
+    )
+    r_gate = pcb.place(
+        _ref("R", ref_start, 1), "R_0603", value="100",
+        pos=(x - 4, y), description="Gate resistor",
+    )
+    r_pulldown = pcb.place(
+        _ref("R", ref_start, 2), "R_0603", value="10k",
+        pos=(x - 4, y + 3), description="Gate pull-down",
+    )
+
+    # Gate via resistor
+    pcb.net(gpio_net, [(r_gate, "1")])
+    pcb.net(f"{gpio_net}_GATE", [(r_gate, "2"), (mosfet, "1"), (r_pulldown, "1")])
+    pcb.power_net("GND", [(mosfet, "2"), (r_pulldown, "2")])
+
+    return {"mosfet": mosfet, "r_gate": r_gate, "r_pulldown": r_pulldown}
 
 
 # ===========================================================================
@@ -1256,6 +1460,26 @@ SUBCIRCUIT_REGISTRY: dict[str, tuple[callable, str, list[str]]] = {
         barrel_jack_power,
         "Barrel jack with polarity protection diode and input filter cap",
         ["VIN", "GND", "JACK_TIP"],
+    ),
+    "relay_driver": (
+        relay_driver,
+        "SPDT relay with NPN transistor driver and flyback diode",
+        ["VBUS", "GND"],
+    ),
+    "i2c_sensor_breakout": (
+        i2c_sensor_breakout,
+        "I2C sensor header (4-pin) with optional pull-ups (BME280, SHT31, etc.)",
+        ["3V3", "GND", "I2C_SDA", "I2C_SCL"],
+    ),
+    "spi_sensor_breakout": (
+        spi_sensor_breakout,
+        "SPI sensor header (6-pin) for ADXL345, BME280-SPI, etc.",
+        ["3V3", "GND", "SPI_SCK", "SPI_MOSI", "SPI_MISO", "SPI_CS"],
+    ),
+    "mosfet_switch": (
+        mosfet_switch,
+        "N-channel MOSFET low-side switch with gate resistor and pull-down",
+        ["GND"],
     ),
 }
 

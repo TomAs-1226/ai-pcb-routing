@@ -317,6 +317,18 @@ class DesignEngine:
         if request.screw_terminals > 0:
             self._add_screw_terminals(pcb, request.screw_terminals, width, height)
 
+        # ── Relay ────────────────────────────────────────────────────
+        if request.relay:
+            self._add_relays(pcb, mcu_comp, request.relay_count, width, height)
+
+        # ── Barrel jack ─────────────────────────────────────────────
+        if request.barrel_jack:
+            self._add_barrel_jack(pcb, width)
+
+        # ── Sensors ─────────────────────────────────────────────────
+        if request.sensors:
+            self._add_sensors(pcb, mcu_comp, request.sensors, width)
+
         # ── Indicator LEDs ───────────────────────────────────────────
         if request.leds > 0:
             self._add_indicator_leds(pcb, mcu_comp, request.leds, width)
@@ -1147,6 +1159,199 @@ class DesignEngine:
             placed.append(term)
 
         self._log.append(f"Added {len(placed)} screw terminal(s) at bottom edge")
+        return placed
+
+    # ── Relays ─────────────────────────────────────────────────────────────
+
+    def _add_relays(
+        self,
+        pcb: PCBDesign,
+        mcu_comp: PlacedComponent,
+        count: int,
+        board_width: float,
+        board_height: float,
+    ) -> list[PlacedComponent]:
+        """Add SPDT relays with transistor drivers and flyback diodes."""
+        placed: list[PlacedComponent] = []
+        # ESP32 GPIO pins safe for relay control
+        gpio_pins = ["IO13", "IO14", "IO27", "IO26", "IO25", "IO33", "IO32", "IO4"]
+
+        for i in range(min(count, 4)):
+            y_pos = board_height / 2 - 10 + i * 22
+            relay_ref = self._next_ref("K")
+            q_ref = self._next_ref("Q")
+            d_ref = self._next_ref("D")
+            rb_ref = self._next_ref("R")
+
+            relay = pcb.place(
+                relay_ref, "Relay_SPDT", value="SRD-05VDC",
+                pos=(board_width - 15, y_pos),
+                description=f"5V SPDT relay {i + 1}",
+            )
+            transistor = pcb.place(
+                q_ref, "SOT-23-3", value="2N2222",
+                pos=(board_width - 25, y_pos + 5),
+                description="NPN relay driver",
+            )
+            diode = pcb.place(
+                d_ref, "SOD-123", value="1N4148",
+                pos=(board_width - 20, y_pos - 3),
+                description="Flyback diode",
+            )
+            r_base = pcb.place(
+                rb_ref, "R_0603", value="1k",
+                pos=(board_width - 30, y_pos + 5),
+                description="Base resistor",
+            )
+
+            # Wire coil
+            coil_net = f"RELAY{i + 1}_COIL"
+            pcb.power_net("VBUS", [(relay, "1"), (diode, "K")])
+            pcb.net(coil_net, [(relay, "2"), (transistor, "3"), (diode, "A")])
+            pcb.power_net("GND", [(transistor, "2")])
+
+            # Wire control from MCU
+            gpio = gpio_pins[i % len(gpio_pins)]
+            ctrl_net = f"RELAY{i + 1}_CTRL"
+            pcb.net(ctrl_net, [(r_base, "1"), (mcu_comp, gpio)])
+            pcb.net(f"RELAY{i + 1}_BASE", [(r_base, "2"), (transistor, "1")])
+
+            placed.extend([relay, transistor, diode, r_base])
+
+        self._log.append(f"Added {min(count, 4)} relay(s) with transistor drivers")
+        return placed
+
+    # ── Barrel Jack ────────────────────────────────────────────────────────
+
+    def _add_barrel_jack(
+        self,
+        pcb: PCBDesign,
+        board_width: float,
+    ) -> PlacedComponent:
+        """Add a DC barrel jack power input with protection diode."""
+        jack = pcb.place(
+            self._next_ref("J"), "BarrelJack_DC", value="Barrel_Jack",
+            pos=(5, 5), description="DC barrel jack",
+        )
+        diode = pcb.place(
+            self._next_ref("D"), "SOD-123", value="1N5819",
+            pos=(14, 5), description="Polarity protection Schottky",
+        )
+        cap = pcb.place(
+            self._next_ref("C"), "C_0805", value="100uF",
+            pos=(14, 9), description="Input filter capacitor",
+        )
+
+        pcb.net("JACK_TIP", [(jack, "1"), (diode, "A")])
+        pcb.power_net("VIN", [(diode, "K"), (cap, "1")])
+        pcb.power_net("GND", [(jack, "2"), (cap, "2")])
+
+        self._log.append("Added barrel jack with polarity protection")
+        return jack
+
+    # ── Sensors ────────────────────────────────────────────────────────────
+
+    _SENSOR_INTERFACE: dict[str, str] = {
+        "bme280": "i2c", "bmp280": "i2c", "sht30": "i2c",
+        "mpu6050": "i2c", "ina219": "i2c", "ads1115": "i2c",
+        "dht22": "gpio", "dht11": "gpio", "ds18b20": "gpio",
+        "max6675": "spi", "hx711": "gpio",
+    }
+
+    def _add_sensors(
+        self,
+        pcb: PCBDesign,
+        mcu_comp: PlacedComponent,
+        sensors: list[str],
+        board_width: float,
+    ) -> list[PlacedComponent]:
+        """Add sensor breakout headers with appropriate interfaces."""
+        placed: list[PlacedComponent] = []
+        i2c_added = False
+
+        for idx, sensor in enumerate(sensors[:4]):
+            iface = self._SENSOR_INTERFACE.get(sensor, "i2c")
+            y_pos = 10 + idx * 10
+
+            if iface == "i2c":
+                header = pcb.place(
+                    self._next_ref("J"), "Sensor_I2C_4pin",
+                    value=sensor.upper(),
+                    pos=(board_width - 8, y_pos),
+                    description=f"I2C sensor: {sensor.upper()}",
+                )
+                pcb.power_net("3V3", [(header, "1")])
+                pcb.power_net("GND", [(header, "2")])
+                # Wire to I2C bus
+                pcb.net("I2C_SDA", [(header, "3"), (mcu_comp, "IO21")])
+                pcb.net("I2C_SCL", [(header, "4"), (mcu_comp, "IO22")])
+
+                if not i2c_added:
+                    # Add pull-ups once
+                    r_sda = pcb.place(
+                        self._next_ref("R"), "R_0603", value="4.7k",
+                        pos=(board_width - 12, y_pos),
+                        description="I2C SDA pull-up",
+                    )
+                    r_scl = pcb.place(
+                        self._next_ref("R"), "R_0603", value="4.7k",
+                        pos=(board_width - 12, y_pos + 3),
+                        description="I2C SCL pull-up",
+                    )
+                    pcb.power_net("3V3", [(r_sda, "1"), (r_scl, "1")])
+                    pcb.net("I2C_SDA", [(r_sda, "2")])
+                    pcb.net("I2C_SCL", [(r_scl, "2")])
+                    placed.extend([r_sda, r_scl])
+                    i2c_added = True
+
+                placed.append(header)
+
+            elif iface == "spi":
+                header = pcb.place(
+                    self._next_ref("J"), "Sensor_SPI_6pin",
+                    value=sensor.upper(),
+                    pos=(board_width - 8, y_pos),
+                    description=f"SPI sensor: {sensor.upper()}",
+                )
+                pcb.power_net("3V3", [(header, "1")])
+                pcb.power_net("GND", [(header, "2")])
+                pcb.net("SPI_SCK", [(header, "3"), (mcu_comp, "IO18")])
+                pcb.net("SPI_MOSI", [(header, "4"), (mcu_comp, "IO23")])
+                pcb.net("SPI_MISO", [(header, "5"), (mcu_comp, "IO19")])
+                pcb.net(f"SPI_CS_{sensor.upper()}", [
+                    (header, "6"), (mcu_comp, "IO5"),
+                ])
+                placed.append(header)
+
+            else:
+                # GPIO-based sensor (DHT, DS18B20, etc.)
+                header = pcb.place(
+                    self._next_ref("J"), "PinHeader_1x03",
+                    value=sensor.upper(),
+                    pos=(board_width - 8, y_pos),
+                    description=f"GPIO sensor: {sensor.upper()}",
+                )
+                gpio_pins = ["IO4", "IO16", "IO17", "IO25"]
+                gpio = gpio_pins[idx % len(gpio_pins)]
+                pcb.power_net("3V3", [(header, "1")])
+                pcb.power_net("GND", [(header, "2")])
+                pcb.net(f"SENSOR_{sensor.upper()}", [
+                    (header, "3"), (mcu_comp, gpio),
+                ])
+                # Pull-up for 1-wire / DHT
+                r_pull = pcb.place(
+                    self._next_ref("R"), "R_0603", value="4.7k",
+                    pos=(board_width - 12, y_pos),
+                    description=f"Pull-up for {sensor.upper()}",
+                )
+                pcb.power_net("3V3", [(r_pull, "1")])
+                pcb.net(f"SENSOR_{sensor.upper()}", [(r_pull, "2")])
+                placed.extend([header, r_pull])
+
+        self._log.append(
+            f"Added {len(sensors[:4])} sensor breakout(s): "
+            f"{', '.join(s.upper() for s in sensors[:4])}"
+        )
         return placed
 
     # ── Mounting Holes ───────────────────────────────────────────────────

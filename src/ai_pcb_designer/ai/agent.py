@@ -293,12 +293,73 @@ class PCBDesignAgent:
                     board=board,
                 )
             else:
-                self._emit(
-                    AgentPhase.ROUTING_TRACES,
-                    "Some nets could not be routed (will attempt fix)",
-                    progress=0.70,
-                    board=board,
-                )
+                # ── Placement optimisation loop ─────────────────────
+                # If too many nets are unrouted the placement is poor.
+                # Re-place with stronger attraction and re-route with
+                # a lower via cost on each iteration.
+                unrouted = board.get_unrouted_nets()
+                unrouted_ratio = len(unrouted) / max(total_nets, 1)
+
+                for opt_pass in range(3):
+                    if unrouted_ratio < 0.15 or self._is_cancelled():
+                        break
+
+                    self._emit(
+                        AgentPhase.PLACING_COMPONENTS,
+                        f"Optimisation pass {opt_pass + 1}: "
+                        f"{len(unrouted)} unrouted nets — "
+                        f"re-placing and re-routing...",
+                        progress=0.50 + opt_pass * 0.05,
+                        board=board,
+                    )
+
+                    board.clear_routing()
+
+                    # Re-place with progressively stronger attraction
+                    opt_cfg = PlacementConfig(
+                        seed=42 + opt_pass + 1,
+                        attraction_strength=0.25 + opt_pass * 0.10,
+                        repulsion_strength=12.0,
+                        boundary_strength=6.0,
+                        convergence_threshold=0.5,
+                    )
+                    opt_placer = PlacementEngine(opt_cfg)
+                    opt_placer.place(board)
+
+                    # Re-route with lower via cost
+                    via_cost = max(15.0, 30.0 - opt_pass * 10)
+                    opt_router = AutoRouter(RouterConfig(via_cost=via_cost))
+                    all_routed, _ = opt_router.route(board)
+
+                    unrouted = board.get_unrouted_nets()
+                    unrouted_ratio = len(unrouted) / max(total_nets, 1)
+
+                    self._emit(
+                        AgentPhase.ROUTING_TRACES,
+                        f"After optimisation pass {opt_pass + 1}: "
+                        f"{len(unrouted)} unrouted "
+                        f"({unrouted_ratio:.0%})",
+                        progress=0.55 + opt_pass * 0.05,
+                        board=board,
+                    )
+
+                    if all_routed:
+                        self._emit(
+                            AgentPhase.ROUTING_TRACES,
+                            "All nets routed after optimisation!",
+                            progress=0.70,
+                            board=board,
+                        )
+                        break
+
+                if not all_routed:
+                    self._emit(
+                        AgentPhase.ROUTING_TRACES,
+                        f"Routing incomplete: {len(board.get_unrouted_nets())} "
+                        f"nets unrouted (DRC will flag these)",
+                        progress=0.70,
+                        board=board,
+                    )
 
             if self._is_cancelled():
                 return None
@@ -774,7 +835,8 @@ class PCBDesignAgent:
                 "from ai_pcb_designer.ai.subcircuits import (\n"
                 "    usb_c_power, ldo_3v3, esp32_minimal,\n"
                 "    led_with_resistor, debug_header, mounting_holes_corners,\n"
-                "    # ... etc\n"
+                "    relay_driver, i2c_sensor_breakout, spi_sensor_breakout,\n"
+                "    mosfet_switch, barrel_jack_power, h_bridge,\n"
                 ")\n"
                 "```\n\n"
                 + list_subcircuits()
@@ -846,6 +908,27 @@ SOT-23 (transistor/MOSFET):
 
 WS2812B (addressable RGB LED):
   1=VDD(5V), 2=DOUT, 3=GND, 4=DIN
+
+BarrelJack_DC (DC power input):
+  1=Tip(VIN+), 2=Sleeve(GND), 3=Switch(NC)
+
+Relay_SPDT (5V relay):
+  1=Coil+, 2=Coil-, 3=COM, 4=NO, 5=NC
+
+SOD-123 (diode):
+  K=Cathode, A=Anode
+
+DPAK_TO252 (power MOSFET):
+  1=Gate, 2=Drain(tab), 3=Source
+
+DIP-8 (through-hole IC):
+  1-4=left side (top to bottom), 5-8=right side (bottom to top)
+
+TO-220 (power package):
+  1=Pin1, 2=Pin2, 3=Pin3
+
+Sensor_I2C_4pin: 1=VCC, 2=GND, 3=SDA, 4=SCL
+Sensor_SPI_6pin: 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
 {subcircuit_info}
 
 ## Design Rules (CRITICAL)
@@ -854,24 +937,38 @@ WS2812B (addressable RGB LED):
 2. EVERY IC must be connected to power AND ground nets
 3. Use power_net() for GND, VCC, 3V3, 5V, VBUS (wider traces)
 4. Use net() for signal connections (standard traces)
-5. Place USB/barrel jack connectors at board edges (y < 15mm from top or x < 15mm from edge)
-6. ALL components must fit inside board boundaries with 5mm margin
-7. Space components at least 3mm apart to avoid overlaps
+5. Place USB/barrel jack connectors at board edges (y < 10mm from top or x < 10mm from edge)
+6. ALL components must fit inside board boundaries with 3mm margin
+7. Space components at least 2mm apart to avoid overlaps
 8. Include pull-up resistors on EN/RESET pins (10k to 3V3)
 9. Include current-limiting resistors for LEDs (330-1k ohm)
 10. Include input AND output capacitors for voltage regulators
 11. Reference designator prefixes: U=IC, R=Resistor, C=Capacitor,
-    D=Diode/LED, J=Connector, SW=Switch, H=Mounting Hole, L=Inductor
+    D=Diode/LED, J=Connector, SW=Switch, H=Mounting Hole, L=Inductor,
+    Q=Transistor/MOSFET, K=Relay
+12. For relays: ALWAYS include a flyback diode (SOD-123) and an NPN
+    driver transistor (SOT-23-3 2N2222) — never drive a relay coil
+    directly from a GPIO pin
+13. For power MOSFETs: include a gate resistor (100Ω) and a
+    gate pull-down (10k)
+14. For I2C buses: include 4.7k pull-ups on SDA and SCL
+15. For barrel jacks: include a polarity-protection Schottky diode
 
 ## Layout Guidelines
 
 - Board origin is top-left (0,0)
-- Connectors go at edges: USB at top center, headers on sides
-- Main IC centered: pos=(width/2, 25-35)
-- Support passives within 5mm of their IC
-- Power section near USB connector
-- Leave 5mm margin from all edges
+- **SIZE THE BOARD COMPACT** — don't waste space.  Typical boards:
+  - Simple sensor board: 40×30mm
+  - ESP32 + a few peripherals: 50×40mm
+  - ESP32 + display + camera: 60×50mm
+  - Complex multi-feature: 70×55mm
+- Connectors go at edges: USB at top center, headers on right
+- Main IC centered: pos=(width/2, 20-30)
+- Passives within 3mm of their IC (decoupling caps < 3mm!)
+- Power section near USB / barrel jack connector
+- Leave 3mm margin from all edges
 - For NxM LED matrices: 10mm pitch, serpentine data wiring
+- Place relays / high-power components away from sensitive signals
 
 Output ONLY the Python code, no explanations. The code MUST end with:
 board = pcb.build()
