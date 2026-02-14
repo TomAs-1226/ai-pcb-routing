@@ -19,6 +19,108 @@ from ..core.datatypes import Layer, PadShape, Point
 from ..core.trace import TraceSegment, Via, CopperZone
 
 
+# ─── Stroke font for silkscreen text ─────────────────────────────────────────
+# Each character is a list of line segments: [(x1, y1, x2, y2), ...]
+# in a 0-1 normalized coordinate system (scaled by font_size at render time).
+
+_FONT: dict[str, list[tuple[float, float, float, float]]] = {
+    "A": [(0, 1, 0.5, 0), (0.5, 0, 1, 1), (0.2, 0.6, 0.8, 0.6)],
+    "B": [(0, 0, 0, 1), (0, 0, 0.7, 0), (0.7, 0, 0.8, 0.15), (0.8, 0.15, 0.8, 0.35),
+          (0.8, 0.35, 0.7, 0.5), (0, 0.5, 0.7, 0.5), (0.7, 0.5, 0.8, 0.65),
+          (0.8, 0.65, 0.8, 0.85), (0.8, 0.85, 0.7, 1), (0, 1, 0.7, 1)],
+    "C": [(1, 0.1, 0.7, 0), (0.7, 0, 0.3, 0), (0.3, 0, 0, 0.3), (0, 0.3, 0, 0.7),
+          (0, 0.7, 0.3, 1), (0.3, 1, 0.7, 1), (0.7, 1, 1, 0.9)],
+    "D": [(0, 0, 0, 1), (0, 0, 0.6, 0), (0.6, 0, 0.9, 0.3), (0.9, 0.3, 0.9, 0.7),
+          (0.9, 0.7, 0.6, 1), (0.6, 1, 0, 1)],
+    "E": [(0, 0, 0, 1), (0, 0, 1, 0), (0, 0.5, 0.7, 0.5), (0, 1, 1, 1)],
+    "F": [(0, 0, 0, 1), (0, 0, 1, 0), (0, 0.5, 0.7, 0.5)],
+    "G": [(1, 0.1, 0.7, 0), (0.7, 0, 0.3, 0), (0.3, 0, 0, 0.3), (0, 0.3, 0, 0.7),
+          (0, 0.7, 0.3, 1), (0.3, 1, 0.7, 1), (0.7, 1, 1, 0.7), (1, 0.7, 1, 0.5),
+          (1, 0.5, 0.6, 0.5)],
+    "H": [(0, 0, 0, 1), (1, 0, 1, 1), (0, 0.5, 1, 0.5)],
+    "I": [(0.3, 0, 0.7, 0), (0.5, 0, 0.5, 1), (0.3, 1, 0.7, 1)],
+    "J": [(0.3, 0, 0.8, 0), (0.6, 0, 0.6, 0.8), (0.6, 0.8, 0.4, 1), (0.4, 1, 0.1, 0.8)],
+    "K": [(0, 0, 0, 1), (1, 0, 0, 0.5), (0, 0.5, 1, 1)],
+    "L": [(0, 0, 0, 1), (0, 1, 1, 1)],
+    "M": [(0, 1, 0, 0), (0, 0, 0.5, 0.5), (0.5, 0.5, 1, 0), (1, 0, 1, 1)],
+    "N": [(0, 1, 0, 0), (0, 0, 1, 1), (1, 1, 1, 0)],
+    "O": [(0.3, 0, 0.7, 0), (0.7, 0, 1, 0.3), (1, 0.3, 1, 0.7), (1, 0.7, 0.7, 1),
+          (0.7, 1, 0.3, 1), (0.3, 1, 0, 0.7), (0, 0.7, 0, 0.3), (0, 0.3, 0.3, 0)],
+    "P": [(0, 0, 0, 1), (0, 0, 0.7, 0), (0.7, 0, 0.9, 0.15), (0.9, 0.15, 0.9, 0.35),
+          (0.9, 0.35, 0.7, 0.5), (0.7, 0.5, 0, 0.5)],
+    "Q": [(0.3, 0, 0.7, 0), (0.7, 0, 1, 0.3), (1, 0.3, 1, 0.7), (1, 0.7, 0.7, 1),
+          (0.7, 1, 0.3, 1), (0.3, 1, 0, 0.7), (0, 0.7, 0, 0.3), (0, 0.3, 0.3, 0),
+          (0.7, 0.7, 1, 1)],
+    "R": [(0, 0, 0, 1), (0, 0, 0.7, 0), (0.7, 0, 0.9, 0.15), (0.9, 0.15, 0.9, 0.35),
+          (0.9, 0.35, 0.7, 0.5), (0.7, 0.5, 0, 0.5), (0.5, 0.5, 1, 1)],
+    "S": [(1, 0.1, 0.7, 0), (0.7, 0, 0.3, 0), (0.3, 0, 0, 0.15), (0, 0.15, 0, 0.35),
+          (0, 0.35, 0.3, 0.5), (0.3, 0.5, 0.7, 0.5), (0.7, 0.5, 1, 0.65),
+          (1, 0.65, 1, 0.85), (1, 0.85, 0.7, 1), (0.7, 1, 0.3, 1), (0.3, 1, 0, 0.9)],
+    "T": [(0, 0, 1, 0), (0.5, 0, 0.5, 1)],
+    "U": [(0, 0, 0, 0.8), (0, 0.8, 0.3, 1), (0.3, 1, 0.7, 1), (0.7, 1, 1, 0.8),
+          (1, 0.8, 1, 0)],
+    "V": [(0, 0, 0.5, 1), (0.5, 1, 1, 0)],
+    "W": [(0, 0, 0.25, 1), (0.25, 1, 0.5, 0.5), (0.5, 0.5, 0.75, 1), (0.75, 1, 1, 0)],
+    "X": [(0, 0, 1, 1), (1, 0, 0, 1)],
+    "Y": [(0, 0, 0.5, 0.5), (1, 0, 0.5, 0.5), (0.5, 0.5, 0.5, 1)],
+    "Z": [(0, 0, 1, 0), (1, 0, 0, 1), (0, 1, 1, 1)],
+    "0": [(0.3, 0, 0.7, 0), (0.7, 0, 1, 0.3), (1, 0.3, 1, 0.7), (1, 0.7, 0.7, 1),
+          (0.7, 1, 0.3, 1), (0.3, 1, 0, 0.7), (0, 0.7, 0, 0.3), (0, 0.3, 0.3, 0)],
+    "1": [(0.3, 0.2, 0.5, 0), (0.5, 0, 0.5, 1), (0.2, 1, 0.8, 1)],
+    "2": [(0, 0.2, 0.3, 0), (0.3, 0, 0.7, 0), (0.7, 0, 1, 0.2), (1, 0.2, 1, 0.4),
+          (1, 0.4, 0, 1), (0, 1, 1, 1)],
+    "3": [(0, 0.1, 0.3, 0), (0.3, 0, 0.7, 0), (0.7, 0, 1, 0.2), (1, 0.2, 0.7, 0.5),
+          (0.7, 0.5, 0.4, 0.5), (0.7, 0.5, 1, 0.8), (1, 0.8, 0.7, 1),
+          (0.7, 1, 0.3, 1), (0.3, 1, 0, 0.9)],
+    "4": [(0, 0, 0, 0.5), (0, 0.5, 1, 0.5), (0.7, 0, 0.7, 1)],
+    "5": [(1, 0, 0, 0), (0, 0, 0, 0.5), (0, 0.5, 0.7, 0.5), (0.7, 0.5, 1, 0.7),
+          (1, 0.7, 1, 0.85), (1, 0.85, 0.7, 1), (0.7, 1, 0.3, 1), (0.3, 1, 0, 0.9)],
+    "6": [(0.7, 0, 0.3, 0), (0.3, 0, 0, 0.3), (0, 0.3, 0, 0.7), (0, 0.7, 0.3, 1),
+          (0.3, 1, 0.7, 1), (0.7, 1, 1, 0.7), (1, 0.7, 0.7, 0.5), (0.7, 0.5, 0, 0.5)],
+    "7": [(0, 0, 1, 0), (1, 0, 0.3, 1)],
+    "8": [(0.3, 0, 0.7, 0), (0.7, 0, 1, 0.15), (1, 0.15, 1, 0.35), (1, 0.35, 0.7, 0.5),
+          (0.3, 0.5, 0, 0.35), (0, 0.35, 0, 0.15), (0, 0.15, 0.3, 0),
+          (0.3, 0.5, 0.7, 0.5), (0.7, 0.5, 1, 0.65), (1, 0.65, 1, 0.85),
+          (1, 0.85, 0.7, 1), (0.7, 1, 0.3, 1), (0.3, 1, 0, 0.85),
+          (0, 0.85, 0, 0.65), (0, 0.65, 0.3, 0.5)],
+    "9": [(1, 0.5, 0.3, 0.5), (0.3, 0.5, 0, 0.3), (0, 0.3, 0.3, 0), (0.3, 0, 0.7, 0),
+          (0.7, 0, 1, 0.3), (1, 0.3, 1, 0.7), (1, 0.7, 0.7, 1), (0.7, 1, 0.3, 1)],
+    " ": [],
+    ".": [(0.4, 0.9, 0.6, 0.9), (0.6, 0.9, 0.6, 1), (0.6, 1, 0.4, 1), (0.4, 1, 0.4, 0.9)],
+    "-": [(0.2, 0.5, 0.8, 0.5)],
+    "_": [(0, 1, 1, 1)],
+    "*": [(0.2, 0.2, 0.8, 0.8), (0.8, 0.2, 0.2, 0.8), (0.5, 0.1, 0.5, 0.9)],
+}
+
+
+def _render_text_to_lines(
+    text: str, x: float, y: float, font_size: float,
+) -> list[tuple[float, float, float, float]]:
+    """Render text to a list of line segments using the stroke font.
+
+    Returns [(x1, y1, x2, y2), ...] in board coordinates.
+    """
+    result: list[tuple[float, float, float, float]] = []
+    char_width = font_size * 0.7
+    cursor_x = x
+
+    for ch in text.upper():
+        strokes = _FONT.get(ch)
+        if strokes is None:
+            cursor_x += char_width
+            continue
+        for x1, y1, x2, y2 in strokes:
+            result.append((
+                cursor_x + x1 * font_size * 0.6,
+                y + y1 * font_size,
+                cursor_x + x2 * font_size * 0.6,
+                y + y2 * font_size,
+            ))
+        cursor_x += char_width
+
+    return result
+
+
 # Layer mapping to Gerber file extensions and attributes
 LAYER_FILE_MAP = {
     Layer.F_CU: ("F_Cu.gbr", ".GTL", "Copper,L1,Top,Signal"),
@@ -163,18 +265,12 @@ class GerberExporter:
                 f"X{self._coord(via.position.x)}Y{self._coord(via.position.y)}D03*"
             )
 
-        # Copper zones on this layer
-        for zone in board.zones:
-            if zone.layer != layer:
-                continue
-            if zone.outline and len(zone.outline) >= 3:
-                lines.append("G36*")
-                first = zone.outline[0]
-                lines.append(f"X{self._coord(first.x)}Y{self._coord(first.y)}D02*")
-                for pt in zone.outline[1:]:
-                    lines.append(f"X{self._coord(pt.x)}Y{self._coord(pt.y)}D01*")
-                lines.append(f"X{self._coord(first.x)}Y{self._coord(first.y)}D01*")
-                lines.append("G37*")
+        # NOTE: Copper zones (pours) are NOT exported to Gerber.
+        # Gerber is a "dumb" format with no clearance computation — a solid
+        # polygon pour would short to every pad on the layer.  Copper zones
+        # are exported only in KiCad format where the EDA tool computes
+        # proper thermal relief and clearance fills.
+        # GND connectivity in Gerber relies on routed traces instead.
 
         lines.append("M02*")
         path.write_text("\n".join(lines))
@@ -256,6 +352,21 @@ class GerberExporter:
                 lines.append(
                     f"X{self._coord(end.x)}Y{self._coord(end.y)}D01*"
                 )
+
+        # Board-level silk text (logos, labels)
+        if is_top:
+            for st in getattr(self.board, "silk_texts", []):
+                text_lines = _render_text_to_lines(
+                    st.text, st.position.x, st.position.y, st.font_size
+                )
+                for x1, y1, x2, y2 in text_lines:
+                    lines.append(f"D{silk_dcode}*")
+                    lines.append(
+                        f"X{self._coord(x1)}Y{self._coord(y1)}D02*"
+                    )
+                    lines.append(
+                        f"X{self._coord(x2)}Y{self._coord(y2)}D01*"
+                    )
 
         lines.append("M02*")
         path.write_text("\n".join(lines))

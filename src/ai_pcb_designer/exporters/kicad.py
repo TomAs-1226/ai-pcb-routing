@@ -54,6 +54,17 @@ class KiCadExporter:
         for zone in board.zones:
             parts.append(self._zone(zone))
 
+        # Board-level silk text (logos, labels)
+        for st in getattr(board, "silk_texts", []):
+            layer_name = st.layer.value if hasattr(st.layer, "value") else "F.SilkS"
+            parts.append(
+                f'  (gr_text "{st.text}" (at {st.position.x:.4f} {st.position.y:.4f})\n'
+                f'    (layer "{layer_name}")\n'
+                f'    (effects (font (size {st.font_size:.1f} {st.font_size:.1f}) '
+                f'(thickness {st.width:.2f})))\n'
+                f'  )'
+            )
+
         # Board outline
         parts.append(self._board_outline())
 

@@ -1,11 +1,13 @@
-"""PCB trace autorouter using A* pathfinding - Phase 3.
+"""PCB trace autorouter using A* pathfinding - Phase 4.
 
-Key improvements for high routing accuracy:
+Key features:
 - Rip-up-and-retry: when a net fails, rip up blocking nets and retry
 - Route short signal nets first, then longer ones, then power/GND last
-- GND uses copper pour instead of individual traces
+- GND gets both routed traces (Gerber connectivity) AND copper pour (KiCad)
+- AI-driven via cost: short signal nets strongly prefer single-layer routing
+- Nearest-neighbor heuristic for multi-pad nets (O(n) vs O(n²))
+- Adaptive grid resolution for large boards (>50 nets)
 - Better obstacle marking with proper clearance
-- Multi-pass routing with different strategies
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ class RouterConfig:
     trace_width: float = 0.25         # mm
     via_diameter: float = 0.8         # mm
     via_drill: float = 0.4            # mm
-    clearance: float = 0.2            # mm
+    clearance: float = 0.25           # mm (edge-to-edge copper clearance)
     via_cost: float = 80.0            # higher = fewer vias
     direction_change_cost: float = 1.5
     max_iterations_per_net: int = 150000
@@ -133,25 +135,43 @@ class AutoRouter:
         self._on_step = callback
 
     def route(self, board: Board) -> tuple[bool, list[RouteStep]]:
-        """Route all nets on the board. Returns (all_routed, steps)."""
+        """Route all nets on the board. Returns (all_routed, steps).
+
+        The router adapts to board complexity: for large boards with
+        many nets (e.g. LED matrices), it adjusts grid resolution and
+        iteration limits to balance quality with performance.
+        """
         self._steps = []
         cfg = self.config
 
-        grid = RoutingGrid(board.settings.width, board.settings.height, cfg.grid_resolution)
+        # AI: adapt grid resolution for large boards
+        board_area = board.settings.width * board.settings.height
+        net_count = len([n for n in board.nets if len(n.pad_refs) >= 2])
+        if board_area > 5000 and net_count > 50:
+            resolution = max(cfg.grid_resolution, 1.0)
+            self._emit_step("", 0, "searching",
+                            message=f"Large design ({net_count} nets, "
+                            f"{board_area:.0f}mm²) — using {resolution}mm grid")
+        else:
+            resolution = cfg.grid_resolution
+
+        grid = RoutingGrid(board.settings.width, board.settings.height, resolution)
+        self._active_resolution = resolution
         self._mark_board_boundary(grid)
         self._mark_all_pads(grid, board)
 
         ordered_nets = self._order_nets(board)
 
-        # Separate GND for pour treatment
+        # Route ALL nets including GND (traces needed for Gerber connectivity)
+        # GND pour is added ADDITIONALLY for KiCad (zone fill handles clearance)
         gnd_nets = [n for n in ordered_nets if n.is_ground and cfg.gnd_pour]
-        signal_nets = [n for n in ordered_nets if not (n.is_ground and cfg.gnd_pour)]
+        all_routeable = ordered_nets  # Route everything
 
         routed_traces: dict[int, tuple[Trace, list[tuple[int, int, int]]]] = {}
         failed_nets: list[Net] = []
 
-        # ─── Pass 1: Route signal and power nets ───────────────────
-        for net in signal_nets:
+        # ─── Pass 1: Route all nets (including GND) ───────────────
+        for net in all_routeable:
             if len(net.pad_refs) < 2:
                 continue
 
@@ -170,7 +190,7 @@ class AutoRouter:
             still_failed = []
             for net in failed_nets:
                 success = self._rip_up_and_retry(
-                    grid, board, net, routed_traces, signal_nets
+                    grid, board, net, routed_traces, all_routeable
                 )
                 if not success:
                     still_failed.append(net)
@@ -182,22 +202,29 @@ class AutoRouter:
                                 message=f"Rip-up pass {attempt + 1}: "
                                 f"{len(failed_nets)} nets still unrouted")
 
-        # ─── Pass 3: GND copper pour ──────────────────────────────
+        # ─── Pass 3: GND copper pour (for KiCad zone fill) ────────
         for net in gnd_nets:
             self._add_ground_pour(board, net)
             self._emit_step(net.name, net.id, "placed",
                             message=f"Added ground pour for {net.name}")
 
-        total_signal = len([n for n in signal_nets if len(n.pad_refs) >= 2])
-        routed_count = total_signal - len(failed_nets)
+        total_routeable = len([n for n in all_routeable if len(n.pad_refs) >= 2])
+        routed_count = total_routeable - len(failed_nets)
 
         return len(failed_nets) == 0, self._steps
 
     def _route_net(
         self, grid: RoutingGrid, board: Board, net: Net,
     ) -> tuple[bool, Trace | None, list[tuple[int, int, int]]]:
-        """Route a single net. Returns (success, trace, path_cells)."""
+        """Route a single net. Returns (success, trace, path_cells).
+
+        The router is AI-aware: it adjusts strategy per net type.
+        Short signal nets between adjacent components get higher via
+        cost (prefer staying on one layer). Power nets get lower via
+        cost (they may need both layers).
+        """
         cfg = self.config
+        res = getattr(self, "_active_resolution", cfg.grid_resolution)
 
         pad_positions = self._get_pad_positions(grid, board, net)
         if len(pad_positions) < 2:
@@ -206,6 +233,22 @@ class AutoRouter:
         trace_width = cfg.power_trace_width if (
             net.is_power or net.is_ground
         ) else cfg.trace_width
+
+        # AI: compute effective via cost based on net characteristics
+        if net.is_power or net.is_ground:
+            effective_via_cost = cfg.via_cost * 0.5  # power: vias OK
+        elif len(pad_positions) == 2:
+            gx1, gy1, _ = pad_positions[0]
+            gx2, gy2, _ = pad_positions[1]
+            est_len = math.hypot(gx2 - gx1, gy2 - gy1) * res
+            if est_len < 15:
+                effective_via_cost = cfg.via_cost * 3.0  # short: avoid vias
+            else:
+                effective_via_cost = cfg.via_cost * 1.5
+        else:
+            effective_via_cost = cfg.via_cost
+
+        self._current_via_cost = effective_via_cost
 
         self._emit_step(net.name, net.id, "searching",
                         message=f"Routing {net.name} ({len(pad_positions)} pads)")
@@ -220,13 +263,41 @@ class AutoRouter:
             best_cost = float("inf")
             best_to = -1
 
+            # AI: nearest-neighbor heuristic instead of trying ALL pairs
+            candidates: list[tuple[float, int, int]] = []
             for ui in unconnected:
+                ux, uy, _ = pad_positions[ui]
+                min_dist = float("inf")
+                best_ci = 0
                 for ci in connected:
+                    cx, cy, _ = pad_positions[ci]
+                    d = math.hypot(ux - cx, uy - cy)
+                    if d < min_dist:
+                        min_dist = d
+                        best_ci = ci
+                candidates.append((min_dist, ui, best_ci))
+            candidates.sort()
+
+            # Try the nearest 3 candidates
+            for _, ui, ci in candidates[:3]:
+                path, switches = self._astar(
+                    grid, pad_positions[ci], pad_positions[ui], net.id
+                )
+                if path is not None:
+                    cost = len(path) + len(switches) * effective_via_cost
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_path = path
+                        best_to = ui
+
+            # If nearest candidates failed, try more
+            if best_path is None and len(candidates) > 3:
+                for _, ui, ci in candidates[3:min(8, len(candidates))]:
                     path, switches = self._astar(
                         grid, pad_positions[ci], pad_positions[ui], net.id
                     )
                     if path is not None:
-                        cost = len(path) + len(switches) * cfg.via_cost
+                        cost = len(path) + len(switches) * effective_via_cost
                         if cost < best_cost:
                             best_cost = cost
                             best_path = path
@@ -240,7 +311,7 @@ class AutoRouter:
             self._path_to_trace(grid, best_path, trace, trace_width, net.id)
 
             clearance_cells = max(1, int(math.ceil(
-                (trace_width / 2 + cfg.clearance) / cfg.grid_resolution
+                (trace_width / 2 + cfg.clearance) / res
             )))
             for gx, gy, layer_idx in best_path:
                 grid.mark_trace(layer_idx, gx, gy, net.id, clearance_cells)
@@ -435,8 +506,9 @@ class AutoRouter:
                     came_from[neighbor] = current
 
             other_layer = 1 - cl
+            via_cost = getattr(self, "_current_via_cost", cfg.via_cost)
             if grid.is_free(other_layer, cx, cy, net_id):
-                new_g = g + cfg.via_cost
+                new_g = g + via_cost
                 via_n = (cx, cy, other_layer)
                 if via_n not in g_score or new_g < g_score[via_n]:
                     g_score[via_n] = new_g

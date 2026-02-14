@@ -524,6 +524,35 @@ def mounting_hole_m2_5() -> Footprint:
     )
 
 
+# ─── Addressable RGB LEDs ──────────────────────────────────────────────────
+
+def ws2812b() -> Footprint:
+    """WS2812B addressable RGB LED (5050 package, 5x5mm).
+
+    Pin 1 = VDD (power), Pin 2 = DOUT (data out),
+    Pin 3 = GND, Pin 4 = DIN (data in).
+    """
+    return Footprint(
+        name="WS2812B",
+        description="WS2812B addressable RGB LED, 5050 package",
+        pads=[
+            _smd_pad("1", -2.45, -1.6, 1.5, 1.0),  # VDD
+            _smd_pad("2", -2.45, 1.6, 1.5, 1.0),   # DOUT
+            _smd_pad("3", 2.45, 1.6, 1.5, 1.0),    # GND
+            _smd_pad("4", 2.45, -1.6, 1.5, 1.0),   # DIN
+        ],
+        silk_lines=[
+            SilkLine(Point(-2.5, -2.5), Point(2.5, -2.5)),
+            SilkLine(Point(2.5, -2.5), Point(2.5, 2.5)),
+            SilkLine(Point(2.5, 2.5), Point(-2.5, 2.5)),
+            SilkLine(Point(-2.5, 2.5), Point(-2.5, -2.5)),
+            # Pin 1 marker
+            SilkLine(Point(-2.5, -2.5), Point(-1.5, -2.5), 0.2),
+        ],
+        courtyard=CourtyardRect(Rect(-3.4, -2.75, 6.8, 5.5)),
+    )
+
+
 # ─── Footprint Registry ────────────────────────────────────────────────────
 
 FOOTPRINT_REGISTRY: dict[str, callable] = {
@@ -565,6 +594,8 @@ FOOTPRINT_REGISTRY: dict[str, callable] = {
     # Mounting
     "MountingHole_M3": mounting_hole_m3,
     "MountingHole_M2.5": mounting_hole_m2_5,
+    # Addressable LEDs
+    "WS2812B": ws2812b,
 }
 
 

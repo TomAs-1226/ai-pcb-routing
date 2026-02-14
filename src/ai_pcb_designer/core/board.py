@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .component import Component
+from .component import Component, SilkText
 from .datatypes import Layer, Point, Rect
 from .net import Net, NetClass
 from .trace import CopperZone, Trace, TraceSegment, Via
@@ -62,6 +62,7 @@ class Board:
     nets: list[Net] = field(default_factory=list)
     traces: list[Trace] = field(default_factory=list)
     zones: list[CopperZone] = field(default_factory=list)
+    silk_texts: list[SilkText] = field(default_factory=list)
     net_classes: list[NetClass] = field(default_factory=list)
     _next_net_id: int = field(default=1, repr=False)
 

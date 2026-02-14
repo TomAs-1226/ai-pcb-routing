@@ -78,6 +78,16 @@ class SilkCircle:
 
 
 @dataclass
+class SilkText:
+    """A text element in the silkscreen layer."""
+    text: str
+    position: Point
+    font_size: float = 1.0  # mm
+    width: float = 0.15  # line width in mm
+    layer: Layer = Layer.F_SILK
+
+
+@dataclass
 class CourtyardRect:
     """Courtyard area for component spacing."""
     rect: Rect

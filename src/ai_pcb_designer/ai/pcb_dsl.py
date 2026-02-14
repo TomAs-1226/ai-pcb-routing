@@ -27,8 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..core.board import Board, BoardSettings, DesignRules
-from ..core.component import Component
-from ..core.datatypes import Point
+from ..core.component import Component, SilkText
+from ..core.datatypes import Layer, Point
 from ..core.net import Net, NetClass
 from ..components.footprints import get_footprint, list_footprints
 
@@ -82,6 +82,7 @@ class PCBDesign:
         self.layers = layers
         self._components: list[PlacedComponent] = []
         self._nets: list[NetDef] = []
+        self._texts: list[dict] = []
         self._net_classes: dict[str, dict] = {
             "Default": {"trace_width": 0.25, "clearance": 0.2},
             "Power": {"trace_width": 0.5, "clearance": 0.25},
@@ -186,6 +187,28 @@ class PCBDesign:
             "clearance": clearance,
         }
 
+    def text(
+        self,
+        text: str,
+        pos: tuple[float, float],
+        font_size: float = 1.0,
+        layer: str = "front",
+    ) -> None:
+        """Add a silkscreen text element to the board.
+
+        Args:
+            text: The text string to display.
+            pos: (x, y) position in mm from board origin.
+            font_size: Font size in mm (default 1.0).
+            layer: "front" or "back" silkscreen layer.
+        """
+        self._texts.append({
+            "text": text,
+            "pos": pos,
+            "font_size": font_size,
+            "layer": layer,
+        })
+
     def build(self) -> Board:
         """Build a Board object from the DSL description.
 
@@ -251,6 +274,16 @@ class PCBDesign:
                     if pad:
                         pad.net_id = net.id
                         pad.net_name = net.name
+
+        # Add silkscreen text elements
+        for td in self._texts:
+            silk_layer = Layer.F_SILK if td["layer"] == "front" else Layer.B_SILK
+            board.silk_texts.append(SilkText(
+                text=td["text"],
+                position=Point(td["pos"][0], td["pos"][1]),
+                font_size=td["font_size"],
+                layer=silk_layer,
+            ))
 
         return board
 

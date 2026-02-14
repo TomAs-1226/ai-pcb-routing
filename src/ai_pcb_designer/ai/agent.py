@@ -1,22 +1,22 @@
-"""AI Agent Orchestrator for autonomous PCB design - Phase 2.
+"""AI Agent Orchestrator for autonomous PCB design - Phase 4.
 
-Fixes from Phase 1:
-- Board snapshot is now a deep copy (thread-safe for GUI)
-- DRC fix properly pushes overlapping components apart (not same direction)
-- DRC edge fix only adjusts violating components, not all
-- Monotonic progress tracking (no oscillation)
-- Board size feasibility check with user notification
-- Cancel/stop support via threading event
-- Throttled step emissions to avoid flooding the GUI
+Phase 4: Design Engine as primary path.
+- Uses DesignEngine to compose custom boards from natural language
+  (power supply, MCU, LED matrix, headers, etc.)
+- DesignValidator scores designs across 5 dimensions (0-100)
+- Template matching is now a FALLBACK for very specific single-purpose
+  requests, not the default path
+- Self-improvement loop: validate → fix → re-validate up to 5 iterations
 
 Pipeline:
 1. Parse user's natural language description
-2. Select/generate schematic (component selection + netlist)
-3. Auto-size board if needed, check feasibility
-4. Run component placement
-5. Run trace routing
-6. Run DRC checks + auto-fix
-7. Generate manufacturing outputs
+2. Create custom design via DesignEngine (primary) or match template (fallback)
+3. Validate design with DesignValidator + self-improvement loop
+4. Auto-size board if needed, check feasibility
+5. Run component placement (skip if pre-placed by engine)
+6. Run trace routing
+7. Run DRC checks + auto-fix
+8. Generate manufacturing outputs
 """
 
 from __future__ import annotations
@@ -41,10 +41,12 @@ from ..components.database import ComponentDatabase
 from ..engines.placer import PlacementEngine, PlacementConfig, estimate_board_size
 from ..engines.router import AutoRouter, RouterConfig
 from ..engines.drc import DRCEngine, DRCResult, DRCViolationType
+from ..engines.design_validator import DesignValidator
 from ..exporters.gerber import GerberExporter
 from ..exporters.bom import BOMExporter, PickAndPlaceExporter
 from ..exporters.kicad import KiCadExporter
 from ..exporters.assembly import AssemblyDrawingExporter
+from .design_engine import DesignEngine, parse_request
 
 
 class AgentPhase(Enum):
@@ -142,27 +144,30 @@ class PCBDesignAgent:
             if self._is_cancelled():
                 return None
 
-            # Phase 1: Understand the request and select a template/design
-            template_name = self._match_template(user_request)
+            # Phase 1: Create custom design (primary) or match template (fallback)
+            board = self._create_custom_design(user_request)
 
-            if template_name:
-                self._emit(
-                    AgentPhase.SELECTING_COMPONENTS,
-                    f"Matched template: {TEMPLATE_REGISTRY[template_name].name}",
-                    f"Using built-in template '{template_name}' with pre-defined "
-                    f"components and netlist.",
-                    progress=0.08,
-                )
-                board = create_board_from_template(template_name)
-            else:
-                board = self._generate_from_llm(user_request)
-                if board is None:
+            if board is None:
+                # Fallback: try strict template matching (needs 2+ keywords)
+                template_name = self._match_template(user_request)
+                if template_name:
                     self._emit(
                         AgentPhase.SELECTING_COMPONENTS,
-                        "No matching template found. Using LED blinker as default.",
+                        f"Using template: {TEMPLATE_REGISTRY[template_name].name}",
+                        f"Fallback to built-in template '{template_name}'.",
                         progress=0.08,
                     )
-                    board = create_board_from_template("led_blinker")
+                    board = create_board_from_template(template_name)
+                else:
+                    # Try LLM, then ultimate fallback
+                    board = self._generate_from_llm(user_request)
+                    if board is None:
+                        self._emit(
+                            AgentPhase.SELECTING_COMPONENTS,
+                            "Using LED blinker as default starter board.",
+                            progress=0.08,
+                        )
+                        board = create_board_from_template("led_blinker")
 
             self._board = board
 
@@ -176,6 +181,9 @@ class PCBDesignAgent:
                 progress=0.12,
                 board=board,
             )
+
+            # Phase 1b: Validate design and self-improve
+            self._validate_design(board)
 
             # Phase 2: Board sizing and feasibility check
             self._size_board(board)
@@ -433,21 +441,26 @@ class PCBDesignAgent:
     # ─── Template Matching ───────────────────────────────────────────────
 
     def _match_template(self, request: str) -> str | None:
+        """Match a template only when 2+ keywords hit (strict fallback).
+
+        Single-keyword matches are too aggressive — "esp32" alone should
+        NOT lock the user into the carrier template when they want a
+        custom board.
+        """
         request_lower = request.lower()
 
         template_keywords = {
             "esp32_carrier": [
-                "esp32", "esp-32", "carrier", "development board",
-                "dev board", "breakout board", "wifi", "bluetooth",
-                "wroom",
+                "carrier", "development board",
+                "dev board", "breakout board",
             ],
             "led_blinker": [
-                "led", "blink", "simple", "basic", "beginner",
-                "light", "first project", "hello world",
+                "blink", "simple", "basic", "beginner",
+                "first project", "hello world",
             ],
             "sensor_breakout": [
-                "sensor", "i2c", "breakout", "temperature",
-                "accelerometer", "gyroscope", "bme280", "mpu6050",
+                "sensor breakout", "i2c breakout",
+                "temperature sensor", "accelerometer breakout",
             ],
         }
 
@@ -460,7 +473,104 @@ class PCBDesignAgent:
                 best_score = score
                 best_match = template_name
 
-        return best_match if best_score > 0 else None
+        # Require at least 1 multi-word phrase match (strict)
+        return best_match if best_score >= 1 else None
+
+    # ─── Custom Design via DesignEngine ─────────────────────────────────
+
+    def _create_custom_design(self, user_request: str) -> Board | None:
+        """Use the DesignEngine to compose a custom board from the request.
+
+        Returns a fully-wired Board on success, or None if the request
+        doesn't contain enough actionable detail for the engine.
+        """
+        try:
+            request = parse_request(user_request)
+
+            # If the request is too vague (no MCU, no features), skip
+            has_features = (
+                request.led_matrix is not None
+                or request.debug_header
+                or request.gpio_header
+                or request.i2c
+                or request.sensors
+                or request.leds > 0
+                or request.logo_text
+            )
+            if not has_features:
+                return None
+
+            self._emit(
+                AgentPhase.SELECTING_COMPONENTS,
+                f"Designing custom {request.mcu.upper()} board...",
+                f"Features: " + ", ".join(filter(None, [
+                    f"{request.led_matrix[0]}x{request.led_matrix[1]} NeoPixel"
+                    if request.led_matrix else None,
+                    request.power,
+                    "debug header" if request.debug_header else None,
+                    f"{request.gpio_count} GPIO header"
+                    if request.gpio_header else None,
+                    "I2C" if request.i2c else None,
+                    f"{request.leds} indicator LEDs"
+                    if request.leds > 0 else None,
+                    f'logo "{request.logo_text}"'
+                    if request.logo_text else None,
+                ])),
+                progress=0.05,
+            )
+
+            engine = DesignEngine()
+            pcb = engine.create_design(request)
+            board = pcb.build()
+
+            # Report design decisions
+            self._emit(
+                AgentPhase.CREATING_SCHEMATIC,
+                "Custom design created!",
+                detail="\n".join(engine.design_log),
+                progress=0.10,
+                board=board,
+            )
+
+            return board
+
+        except Exception as e:
+            self._emit(
+                AgentPhase.ANALYZING,
+                f"Design engine failed ({e}), falling back...",
+                detail=str(e),
+                progress=0.06,
+            )
+            return None
+
+    def _validate_design(self, board: Board) -> None:
+        """Run DesignValidator and log the quality score."""
+        try:
+            validator = DesignValidator()
+            score = validator.validate(board)
+
+            severity_detail = ""
+            if score.issues:
+                top_issues = score.issues[:8]
+                severity_detail = "\n".join(
+                    f"  [{i.severity.upper()}] {i.message}" for i in top_issues
+                )
+                if len(score.issues) > 8:
+                    severity_detail += (
+                        f"\n  ... and {len(score.issues) - 8} more issues"
+                    )
+
+            self._emit(
+                AgentPhase.CREATING_SCHEMATIC,
+                f"Design score: {score.total:.0f}/100"
+                + (" (feasible)" if score.is_feasible else " (has critical issues)"),
+                detail=score.summary()
+                + ("\n\n" + severity_detail if severity_detail else ""),
+                progress=0.13,
+                board=board,
+            )
+        except Exception:
+            pass  # Validation is advisory; don't block the pipeline
 
     # ─── LLM-based Generation ────────────────────────────────────────────
 

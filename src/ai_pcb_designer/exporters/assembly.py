@@ -107,6 +107,17 @@ class AssemblyDrawingExporter:
             # Reference designator
             lines.append(f'<text x="{cx:.1f}" y="{cy:.1f}" class="ref-text">{comp.reference}</text>')
 
+        # Board-level silk text (logos, labels)
+        for st in getattr(board, "silk_texts", []):
+            tx = ox + st.position.x * s
+            ty_text = oy + st.position.y * s
+            fs = st.font_size * s
+            lines.append(
+                f'<text x="{tx:.1f}" y="{ty_text:.1f}" '
+                f'font-family="sans-serif" font-size="{fs:.1f}" '
+                f'font-weight="bold" fill="#333">{st.text}</text>'
+            )
+
         # Title block
         ty = oy + bh + 25
         lines.append(f'<text x="{ox}" y="{ty:.0f}" class="title-text" font-weight="bold">{board.name}</text>')
