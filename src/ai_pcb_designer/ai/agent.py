@@ -498,13 +498,30 @@ class PCBDesignAgent:
     def _create_custom_design(self, user_request: str) -> Board | None:
         """Use the DesignEngine to compose a custom board from the request.
 
+        If the user explicitly selected an LLM provider (openai / anthropic),
+        prefer the LLM path so the AI actually reasons about the design.
+        Falls back to the algorithmic DesignEngine only when no LLM is
+        configured or the LLM call fails.
+
         Returns a fully-wired Board on success, or None if the request
         doesn't contain enough actionable detail for the engine.
         """
+        # If the user explicitly chose an LLM provider, use it first
+        if self.config.llm_provider not in ("template", ""):
+            board = self._generate_from_llm(user_request)
+            if board is not None:
+                return board
+            # LLM failed — fall through to DesignEngine as a fallback
+            self._emit(
+                AgentPhase.ANALYZING,
+                "LLM design failed, falling back to algorithmic engine...",
+                progress=0.06,
+            )
+
         try:
             request = parse_request(user_request)
 
-            # If the request is too vague (no features at all), let LLM handle it
+            # If the request is too vague (no features at all), nothing we can do
             has_features = (
                 request.led_matrix is not None
                 or request.neopixel_strip > 0
@@ -526,8 +543,7 @@ class PCBDesignAgent:
                 or request.logo_text
             )
             if not has_features:
-                # Try LLM for novel designs the hardcoded engine can't handle
-                return self._generate_from_llm(user_request)
+                return None
 
             self._emit(
                 AgentPhase.SELECTING_COMPONENTS,
