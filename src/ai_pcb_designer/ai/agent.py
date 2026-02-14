@@ -305,6 +305,7 @@ class PCBDesignAgent:
 
             # Phase 5: DRC
             drc_passed = False
+            drc_result = None
             for attempt in range(self.config.max_drc_retries + 1):
                 self._emit(
                     AgentPhase.RUNNING_DRC,
@@ -319,7 +320,8 @@ class PCBDesignAgent:
                     drc_passed = True
                     self._emit(
                         AgentPhase.RUNNING_DRC,
-                        f"DRC PASSED! ({drc_result.warning_count} warnings)",
+                        f"DRC PASSED! ({drc_result.warning_count} warnings, "
+                        f"{drc_result.info_count} recommendations)",
                         progress=0.80,
                         board=board,
                     )
@@ -346,6 +348,23 @@ class PCBDesignAgent:
                     progress=0.80,
                     board=board,
                 )
+
+            # Always surface warnings and recommendations, even when
+            # DRC passes — a "passing" board can still have quality
+            # issues that would make it non-functional in practice.
+            if drc_result is not None:
+                warn_detail = drc_result.warnings_detail()
+                if warn_detail:
+                    self._emit(
+                        AgentPhase.RUNNING_DRC,
+                        (
+                            "Quality review — issues to check before "
+                            "ordering:"
+                        ),
+                        detail=warn_detail,
+                        progress=0.81,
+                        board=board,
+                    )
 
             # Phase 6: Generate manufacturing outputs
             self._emit(
