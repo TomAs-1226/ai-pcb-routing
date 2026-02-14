@@ -276,12 +276,24 @@ class PlacementEngine:
         self, components: list[Component], fixed_refs: set[str],
         connectivity: dict, bw: float, bh: float, margin: float,
     ) -> None:
-        """Force-directed refinement to optimize placement."""
+        """Force-directed refinement to optimize placement.
+
+        Enhanced with:
+        - Adaptive temperature schedule (simulated annealing-like)
+        - Stuck detection with random perturbation to escape local minima
+        - Stronger overlap resolution forces
+        """
         cfg = self.config
+        rng = random.Random(cfg.seed or 42)
         velocities = {c.reference: (0.0, 0.0) for c in components}
+
+        prev_movement = float("inf")
+        stuck_iters = 0
 
         for iteration in range(1, cfg.max_iterations + 1):
             total_movement = 0.0
+            # Adaptive temperature: decreases over time
+            temp = max(0.3, 1.0 - iteration / cfg.max_iterations)
 
             for comp in components:
                 if comp.reference in fixed_refs:
@@ -319,7 +331,7 @@ class PlacementEngine:
                     if overlap > 0 or dist < 8.0:
                         force = cfg.repulsion_strength / max(dist, 1.0)
                         if overlap > 0:
-                            force *= 3.0  # much stronger when overlapping
+                            force *= 4.0  # even stronger when overlapping
                         fx += force * dx / dist
                         fy += force * dy / dist
 
@@ -333,20 +345,25 @@ class PlacementEngine:
                 if comp_rect.bottom > bh - margin:
                     fy -= cfg.boundary_strength * (comp_rect.bottom - bh + margin + 2.0)
 
+                # Random perturbation when stuck to escape local minima
+                if stuck_iters > 10:
+                    jitter = 0.5 * (stuck_iters - 10) * temp
+                    fx += rng.uniform(-jitter, jitter)
+                    fy += rng.uniform(-jitter, jitter)
+
                 # Update velocity with damping
                 vx, vy = velocities[comp.reference]
                 vx = (vx + fx) * cfg.damping
                 vy = (vy + fy) * cfg.damping
 
-                # Clamp velocity
+                # Clamp velocity (adaptive max speed)
                 speed = math.hypot(vx, vy)
-                max_speed = 2.0
+                max_speed = 2.0 + (1.0 if stuck_iters > 5 else 0.0)
                 if speed > max_speed:
                     scale = max_speed / speed
                     vx *= scale
                     vy *= scale
 
-                # Store clamped velocity
                 velocities[comp.reference] = (vx, vy)
 
                 new_x = self._clamp_x(comp.position.x + vx, comp, bw, margin)
@@ -356,6 +373,13 @@ class PlacementEngine:
                 total_movement += movement
                 comp.position = Point(new_x, new_y)
 
+            # Detect stuck state
+            if abs(total_movement - prev_movement) < 0.01:
+                stuck_iters += 1
+            else:
+                stuck_iters = 0
+            prev_movement = total_movement
+
             # Emit every 20th step to avoid flooding GUI
             if iteration % 20 == 0:
                 self._emit_step(
@@ -363,7 +387,7 @@ class PlacementEngine:
                     f"Refining placement ({iteration}/{cfg.max_iterations})",
                 )
 
-            if total_movement < cfg.convergence_threshold:
+            if total_movement < cfg.convergence_threshold and stuck_iters == 0:
                 self._emit_step(
                     iteration, components, total_movement,
                     f"Placement converged at iteration {iteration}",
@@ -374,9 +398,19 @@ class PlacementEngine:
         self, components: list[Component], fixed_refs: set[str],
         bw: float, bh: float, margin: float,
     ) -> None:
-        """Final pass: push apart any remaining overlapping components."""
-        for _ in range(50):
+        """Final pass: push apart any remaining overlapping components.
+
+        Uses progressive strategies:
+        1. Direct push along the offset vector (fast)
+        2. If stuck (same overlaps persist), try perpendicular displacement
+        3. If still stuck, try random jitter to escape local minima
+        """
+        prev_overlap_count = float("inf")
+        stuck_counter = 0
+
+        for iteration in range(100):  # More iterations for complex boards
             any_overlap = False
+            overlap_count = 0
             for i, c1 in enumerate(components):
                 for c2 in components[i + 1:]:
                     r1 = c1.bounding_rect().expanded(0.5)
@@ -384,23 +418,53 @@ class PlacementEngine:
                     if not r1.overlaps(r2):
                         continue
                     any_overlap = True
+                    overlap_count += 1
 
                     dx = c1.position.x - c2.position.x
                     dy = c1.position.y - c2.position.y
                     dist = max(math.hypot(dx, dy), 0.1)
-                    push = 1.0
+
+                    # Progressive push strength
+                    push = 1.5 + (iteration / 50.0)  # Increase force over time
+
+                    # Strategy 2: If stuck, add perpendicular component
+                    if stuck_counter > 3:
+                        perp_x, perp_y = -dy / dist, dx / dist
+                        jitter = 0.5 * (stuck_counter - 3)
+                        dx = dx / dist + perp_x * jitter
+                        dy = dy / dist + perp_y * jitter
+                        norm = max(math.hypot(dx, dy), 0.1)
+                        dx /= norm
+                        dy /= norm
+                    else:
+                        dx /= dist
+                        dy /= dist
+
+                    # Strategy 3: Random jitter when very stuck
+                    if stuck_counter > 8:
+                        rng = random.Random(iteration * 100 + i)
+                        dx += rng.uniform(-0.5, 0.5)
+                        dy += rng.uniform(-0.5, 0.5)
+                        push *= 1.5
 
                     if c1.reference not in fixed_refs:
-                        new_x = self._clamp_x(c1.position.x + push * dx / dist, c1, bw, margin)
-                        new_y = self._clamp_y(c1.position.y + push * dy / dist, c1, bh, margin)
+                        new_x = self._clamp_x(c1.position.x + push * dx, c1, bw, margin)
+                        new_y = self._clamp_y(c1.position.y + push * dy, c1, bh, margin)
                         c1.position = Point(new_x, new_y)
                     if c2.reference not in fixed_refs:
-                        new_x = self._clamp_x(c2.position.x - push * dx / dist, c2, bw, margin)
-                        new_y = self._clamp_y(c2.position.y - push * dy / dist, c2, bh, margin)
+                        new_x = self._clamp_x(c2.position.x - push * dx, c2, bw, margin)
+                        new_y = self._clamp_y(c2.position.y - push * dy, c2, bh, margin)
                         c2.position = Point(new_x, new_y)
 
             if not any_overlap:
                 break
+
+            # Detect if we're stuck (no progress)
+            if overlap_count >= prev_overlap_count:
+                stuck_counter += 1
+            else:
+                stuck_counter = 0
+            prev_overlap_count = overlap_count
 
     def _snap_and_clamp(
         self, components: list[Component], bw: float, bh: float, margin: float,

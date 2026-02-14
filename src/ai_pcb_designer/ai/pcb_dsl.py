@@ -335,6 +335,13 @@ class PCBDesign:
         for pc in self._components:
             fp = get_footprint(pc.footprint_name)
             if fp is None:
+                # Try dynamic component discovery before failing
+                try:
+                    from ..components.discovery import discover_footprint
+                    fp = discover_footprint(pc.footprint_name)
+                except ImportError:
+                    pass
+            if fp is None:
                 available = ", ".join(list_footprints())
                 raise ValueError(
                     f"Unknown footprint '{pc.footprint_name}'. "
@@ -393,9 +400,16 @@ class PCBDesign:
         """
         errors = []
 
-        # Check all footprints exist
+        # Check all footprints exist (with discovery fallback)
         for pc in self._components:
-            if get_footprint(pc.footprint_name) is None:
+            fp = get_footprint(pc.footprint_name)
+            if fp is None:
+                try:
+                    from ..components.discovery import discover_footprint
+                    fp = discover_footprint(pc.footprint_name)
+                except ImportError:
+                    pass
+            if fp is None:
                 errors.append(f"Unknown footprint '{pc.footprint_name}' for {pc.reference}")
 
         # Check for duplicate references

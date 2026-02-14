@@ -1,22 +1,23 @@
-"""AI Agent Orchestrator for autonomous PCB design - Phase 4.
+"""AI Agent Orchestrator for autonomous PCB design - Phase 5 (Agentic).
 
-Phase 4: Design Engine as primary path.
-- Uses DesignEngine to compose custom boards from natural language
-  (power supply, MCU, LED matrix, headers, etc.)
-- DesignValidator scores designs across 5 dimensions (0-100)
-- Template matching is now a FALLBACK for very specific single-purpose
-  requests, not the default path
-- Self-improvement loop: validate → fix → re-validate up to 5 iterations
+Phase 5: Fully agentic AI-driven design with continuous improvement.
+- Multi-iteration agentic loop: AI designs → validates → learns → improves
+- AI self-notes: agent remembers design rules and lessons across iterations
+- Component discovery: AI can use ANY component, not just the built-in library
+- Physics enforcement: strict electrical/physical rules in every prompt
+- Chat-like workflow: users can intervene at any point
+- Web scraping: AI can look up datasheets and component info
 
-Pipeline:
+Pipeline (agentic loop):
 1. Parse user's natural language description
-2. Create custom design via DesignEngine (primary) or match template (fallback)
-3. Validate design with DesignValidator + self-improvement loop
-4. Auto-size board if needed, check feasibility
-5. Run component placement (skip if pre-placed by engine)
-6. Run trace routing
-7. Run DRC checks + auto-fix
+2. AI designs board (LLM or DesignEngine)
+3. Validate design → AI reviews score + issues
+4. AI writes self-notes about what went wrong
+5. AI redesigns with improved approach (repeat up to N iterations)
+6. Place components → route traces → DRC → auto-fix
+7. If still failing, AI re-thinks placement strategy
 8. Generate manufacturing outputs
+9. Present results to user with full task list
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ from ..exporters.bom import BOMExporter, PickAndPlaceExporter
 from ..exporters.kicad import KiCadExporter
 from ..exporters.assembly import AssemblyDrawingExporter
 from .design_engine import DesignEngine, parse_request
+from .notes import DesignMemory
 
 
 class AgentPhase(Enum):
@@ -85,10 +87,10 @@ class AgentConfig:
       provide your ``api_key`` (or set the ``OPENAI_API_KEY`` /
       ``ANTHROPIC_API_KEY`` environment variable).
 
-      For OpenAI, the default model is ``"o3-mini"`` -- a thinking/
-      reasoning model that plans circuit design before writing code.
-      Other good choices: ``"o4-mini"``, ``"o1"``, ``"gpt-4o"``,
-      ``"gpt-4.1"``
+      For OpenAI, the default model is ``"o4-mini"`` -- a reasoning
+      model that thinks through circuit physics before generating
+      code, at an affordable price point.
+      Other choices: ``"gpt-4.1"``, ``"gpt-4o"``, ``"o3-mini"``
 
       For Anthropic, the default model is ``"claude-sonnet-4-5-20250929"``.
 
@@ -100,9 +102,10 @@ class AgentConfig:
     """
     llm_provider: str = "template"  # "openai", "anthropic", or "template"
     api_key: str = ""
-    model: str = ""  # "" = auto-select best thinking model
+    model: str = ""  # "" = auto-select (o4-mini for OpenAI, claude-sonnet for Anthropic)
     output_dir: str = "./output"
-    max_drc_retries: int = 3
+    max_drc_retries: int = 5
+    max_agent_iterations: int = 5  # AI self-review iterations
     generate_kicad: bool = True
     generate_gerbers: bool = True
     generate_bom: bool = True
@@ -111,23 +114,47 @@ class AgentConfig:
     user_height: float = 0.0   # User-requested board height (0 = auto)
 
 
+@dataclass
+class ChatMessage:
+    """A message in the agent's chat log, visible to the user."""
+    role: str  # "agent", "user", "system", "task"
+    content: str
+    detail: str = ""
+    timestamp: float = field(default_factory=time.time)
+    task_status: str = ""  # "running", "done", "failed", ""
+    iteration: int = 0
+
+
 class PCBDesignAgent:
-    """Autonomous PCB design agent.
+    """Autonomous PCB design agent with continuous improvement.
 
     Orchestrates the entire design flow from natural language input
-    to manufacturing-ready output files.
+    to manufacturing-ready output files. Features:
+
+    - Multi-iteration agentic loop: designs, validates, learns, improves
+    - Self-notes: AI remembers design rules and lessons across iterations
+    - Component discovery: can use ANY component via dynamic footprints
+    - Physics enforcement: strict electrical rules in every LLM prompt
+    - Chat interface: real-time messages with task status
+    - User intervention: accepts mid-design feedback via message queue
     """
 
     def __init__(self, config: AgentConfig | None = None) -> None:
         self.config = config or AgentConfig()
         self._steps: list[AgentStep] = []
         self._on_step: Callable[[AgentStep], None] | None = None
+        self._on_chat: Callable[[ChatMessage], None] | None = None
         self._phase = AgentPhase.IDLE
         self._board: Board | None = None
         self._component_db = ComponentDatabase()
         self._cancel_event = threading.Event()
         self._progress = 0.0  # monotonically increasing
         self._last_emit_time = 0.0
+        self._memory = DesignMemory()
+        self._chat_log: list[ChatMessage] = []
+        self._user_messages: list[str] = []  # Queue for user interventions
+        self._user_msg_lock = threading.Lock()
+        self._tasks: list[dict] = []  # {"name": str, "status": str}
 
     @property
     def board(self) -> Board | None:
@@ -141,8 +168,58 @@ class PCBDesignAgent:
     def steps(self) -> list[AgentStep]:
         return self._steps
 
+    @property
+    def chat_log(self) -> list[ChatMessage]:
+        return self._chat_log
+
+    @property
+    def memory(self) -> DesignMemory:
+        return self._memory
+
+    @property
+    def tasks(self) -> list[dict]:
+        return self._tasks
+
     def set_step_callback(self, callback: Callable[[AgentStep], None]) -> None:
         self._on_step = callback
+
+    def set_chat_callback(self, callback: Callable[[ChatMessage], None]) -> None:
+        """Set callback for chat messages (for GUI display)."""
+        self._on_chat = callback
+
+    def send_user_message(self, message: str) -> None:
+        """Queue a user intervention message during design."""
+        with self._user_msg_lock:
+            self._user_messages.append(message)
+
+    def _get_user_messages(self) -> list[str]:
+        """Drain the user message queue."""
+        with self._user_msg_lock:
+            msgs = self._user_messages[:]
+            self._user_messages.clear()
+            return msgs
+
+    def _chat(self, role: str, content: str, detail: str = "",
+              task_status: str = "", iteration: int = 0) -> None:
+        """Add a chat message and notify the callback."""
+        msg = ChatMessage(
+            role=role, content=content, detail=detail,
+            task_status=task_status, iteration=iteration,
+        )
+        self._chat_log.append(msg)
+        if self._on_chat:
+            try:
+                self._on_chat(msg)
+            except Exception:
+                pass
+
+    def _update_task(self, name: str, status: str) -> None:
+        """Update or add a task in the task list."""
+        for task in self._tasks:
+            if task["name"] == name:
+                task["status"] = status
+                return
+        self._tasks.append({"name": name, "status": status})
 
     def cancel(self) -> None:
         """Signal the agent to stop as soon as possible."""
@@ -152,92 +229,190 @@ class PCBDesignAgent:
         return self._cancel_event.is_set()
 
     def design(self, user_request: str) -> Board | None:
-        """Run the full autonomous design pipeline."""
+        """Run the full autonomous agentic design pipeline.
+
+        This is a multi-iteration loop where the AI:
+        1. Creates an initial design
+        2. Validates it (physics, DRC, layout quality)
+        3. Learns from issues (writes self-notes)
+        4. Improves the design (repeat up to max_agent_iterations)
+        5. Places, routes, and generates outputs
+
+        User can intervene at any point via send_user_message().
+        """
         try:
             self._cancel_event.clear()
             self._progress = 0.0
+            self._tasks.clear()
+            self._chat_log.clear()
+            self._memory.clear_session()
 
+            # Define task list (visible to user)
+            task_names = [
+                "Analyze request",
+                "Design circuit",
+                "Validate physics & rules",
+                "Place components",
+                "Route traces",
+                "Run DRC checks",
+                "Generate outputs",
+            ]
+            for name in task_names:
+                self._update_task(name, "pending")
+
+            self._chat("agent", "Starting design...",
+                       f"Request: {user_request}")
             self._emit(AgentPhase.ANALYZING, "Analyzing your request...",
                        f"Input: {user_request}", progress=0.02)
 
             if self._is_cancelled():
                 return None
 
-            # Phase 1: Create custom design
-            # Priority: design engine → LLM → strict template match → default
-            board = self._create_custom_design(user_request)
+            # ── Task 1: Analyze ──────────────────────────────────
+            self._update_task("Analyze request", "running")
+            self._chat("task", "Analyzing request...",
+                       task_status="running")
 
-            if board is None:
-                # Fallback: strict template match
-                template_name = self._match_template(user_request)
-                if template_name:
-                    self._emit(
-                        AgentPhase.SELECTING_COMPONENTS,
-                        f"Using template: {TEMPLATE_REGISTRY[template_name].name}",
-                        f"Fallback to built-in template '{template_name}'.",
-                        progress=0.08,
-                    )
-                    board = create_board_from_template(template_name)
-                elif self.config.llm_provider not in ("template", ""):
-                    # LLM was explicitly selected but failed -- try the
-                    # algorithmic DesignEngine one more time with the
-                    # raw request before giving up.
-                    self._emit(
-                        AgentPhase.SELECTING_COMPONENTS,
-                        "LLM and template matching failed. "
-                        "Attempting algorithmic design engine...",
-                        progress=0.07,
-                    )
-                    try:
-                        engine = DesignEngine()
-                        request_parsed = parse_request(user_request)
-                        pcb = engine.create_design(request_parsed)
-                        board = pcb.build()
-                    except Exception:
-                        board = None
+            # Check for user interventions
+            user_msgs = self._get_user_messages()
+            if user_msgs:
+                user_request = user_request + "\n\nUser additions: " + " ".join(user_msgs)
+                self._chat("system", f"Incorporated user feedback: {user_msgs}")
+
+            self._update_task("Analyze request", "done")
+
+            # ── Task 2: Design (agentic loop) ────────────────────
+            self._update_task("Design circuit", "running")
+            self._chat("task", "Designing circuit...",
+                       task_status="running")
+
+            best_board = None
+            best_score = -1
+            max_iters = self.config.max_agent_iterations
+
+            for iteration in range(1, max_iters + 1):
+                if self._is_cancelled():
+                    return None
+
+                self._chat("agent",
+                           f"Design iteration {iteration}/{max_iters}",
+                           task_status="running", iteration=iteration)
+
+                # Check for user interventions mid-loop
+                user_msgs = self._get_user_messages()
+                if user_msgs:
+                    for msg in user_msgs:
+                        self._chat("user", msg)
+                        user_request += f"\n\nUser feedback (iter {iteration}): {msg}"
+                        self._memory.add_note("STRATEGY",
+                                              f"User requested: {msg}", priority=3)
+
+                # Create design (with notes from previous iterations)
+                board = self._create_custom_design(user_request, iteration)
+
+                if board is None:
+                    # Fallback chain
+                    template_name = self._match_template(user_request)
+                    if template_name:
+                        board = create_board_from_template(template_name)
+                        self._chat("agent",
+                                   f"Used template: {template_name}")
+                    else:
+                        try:
+                            engine = DesignEngine()
+                            request_parsed = parse_request(user_request)
+                            pcb = engine.create_design(request_parsed)
+                            board = pcb.build()
+                            self._chat("agent",
+                                       "Created design via algorithmic engine",
+                                       detail="\n".join(engine.design_log[-5:]))
+                        except Exception as e:
+                            self._memory.add_error(
+                                str(e),
+                                "Design engine failed - simplify component count"
+                            )
+                            board = None
 
                     if board is None:
-                        self._emit(
-                            AgentPhase.SELECTING_COMPONENTS,
-                            "Could not generate a design for this request. "
-                            "Using a simple starter board -- please try "
-                            "rephrasing with specific components.",
-                            progress=0.08,
-                        )
+                        if iteration < max_iters:
+                            self._chat("agent",
+                                       f"Design attempt {iteration} failed, retrying...")
+                            self._memory.add_error(
+                                "Could not create design",
+                                "Try different approach next iteration"
+                            )
+                            continue
                         board = create_board_from_template("led_blinker")
+                        self._chat("agent",
+                                   "Falling back to LED blinker starter board")
+
+                # Validate the design
+                self._emit(
+                    AgentPhase.CREATING_SCHEMATIC,
+                    f"Iteration {iteration}: {board.name}",
+                    f"{len(board.components)} components, {len(board.nets)} nets",
+                    progress=0.05 + (iteration / max_iters) * 0.15,
+                    board=board,
+                )
+
+                score = self._validate_design(board)
+                self._memory.log_iteration(iteration,
+                    f"Score={score}, {len(board.components)} comps, "
+                    f"{len(board.nets)} nets")
+
+                if score > best_score:
+                    best_score = score
+                    best_board = copy.deepcopy(board)
+
+                # Physics-aware evaluation
+                if score >= 80:
+                    self._chat("agent",
+                               f"Design quality: {score}/100 - good enough to proceed",
+                               iteration=iteration)
+                    break
+                elif iteration < max_iters:
+                    self._chat("agent",
+                               f"Design quality: {score}/100 - improving...",
+                               detail=f"Issues found, learning and retrying.",
+                               iteration=iteration)
+                    self._memory.add_note("STRATEGY",
+                        f"Iteration {iteration} scored {score}. "
+                        "Need to fix validation issues for next attempt.")
                 else:
-                    self._emit(
-                        AgentPhase.SELECTING_COMPONENTS,
-                        "No matching template found. "
-                        "Using LED blinker as default starter board.",
-                        progress=0.08,
-                    )
-                    board = create_board_from_template("led_blinker")
+                    self._chat("agent",
+                               f"Final design quality: {score}/100",
+                               iteration=iteration)
 
+            # Use best design from all iterations
+            board = best_board or board
             self._board = board
-
-            if self._is_cancelled():
-                return None
+            self._update_task("Design circuit", "done")
 
             self._emit(
                 AgentPhase.CREATING_SCHEMATIC,
-                f"Board created: {board.name}",
-                f"{len(board.components)} components, {len(board.nets)} nets",
-                progress=0.12,
+                f"Board finalized: {board.name}",
+                f"{len(board.components)} components, {len(board.nets)} nets "
+                f"(best score: {best_score})",
+                progress=0.20,
                 board=board,
             )
 
-            # Phase 1b: Validate design and self-improve
-            self._validate_design(board)
+            # ── Task 3: Validate physics ──────────────────────────
+            self._update_task("Validate physics & rules", "running")
+            self._chat("task", "Validating physics and design rules...",
+                       task_status="running")
 
-            # Phase 2: Board sizing and feasibility check
             self._size_board(board)
+            self._update_task("Validate physics & rules", "done")
 
             if self._is_cancelled():
                 return None
 
-            # Phase 3: Component placement
-            # Check if components already have positions (from DSL templates)
+            # ── Task 4: Place components ──────────────────────────
+            self._update_task("Place components", "running")
+            self._chat("task", "Placing components...",
+                       task_status="running")
+
             has_positions = self._components_have_positions(board)
 
             if has_positions:
@@ -280,10 +455,18 @@ class PCBDesignAgent:
                     board=board,
                 )
 
+            self._update_task("Place components", "done")
+            self._chat("task", f"Placed {len(board.components)} components",
+                       task_status="done")
+
             if self._is_cancelled():
                 return None
 
-            # Phase 4: Trace routing
+            # ── Task 5: Route traces ──────────────────────────────
+            self._update_task("Route traces", "running")
+            self._chat("task", "Routing traces...",
+                       task_status="running")
+
             self._emit(
                 AgentPhase.ROUTING_TRACES,
                 "Routing traces...",
@@ -297,7 +480,6 @@ class PCBDesignAgent:
 
             def on_route_step(step):
                 route_net_count[0] += 1
-                # Throttle: only emit on phase changes
                 if step.phase in ("placed", "failed"):
                     frac = route_net_count[0] / max(total_nets, 1)
                     self._emit(
@@ -320,42 +502,52 @@ class PCBDesignAgent:
                     progress=0.70,
                     board=board,
                 )
+                self._chat("agent", "All nets routed successfully!")
             else:
-                # ── Placement optimisation loop ─────────────────────
-                # If too many nets are unrouted the placement is poor.
-                # Re-place with stronger attraction and re-route with
-                # a lower via cost on each iteration.
+                # Placement optimisation loop with multiple strategies
                 unrouted = board.get_unrouted_nets()
                 unrouted_ratio = len(unrouted) / max(total_nets, 1)
 
-                for opt_pass in range(3):
-                    if unrouted_ratio < 0.15 or self._is_cancelled():
+                for opt_pass in range(4):  # More passes than before
+                    if unrouted_ratio < 0.10 or self._is_cancelled():
                         break
+
+                    self._chat("agent",
+                        f"Optimization pass {opt_pass + 1}: "
+                        f"{len(unrouted)} unrouted nets, re-placing...")
 
                     self._emit(
                         AgentPhase.PLACING_COMPONENTS,
                         f"Optimisation pass {opt_pass + 1}: "
                         f"{len(unrouted)} unrouted nets -- "
                         f"re-placing and re-routing...",
-                        progress=0.50 + opt_pass * 0.05,
+                        progress=0.50 + opt_pass * 0.04,
                         board=board,
                     )
 
                     board.clear_routing()
 
-                    # Re-place with progressively stronger attraction
+                    # Progressive optimization strategies
+                    strategies = [
+                        {"seed": 43, "attraction": 0.30, "repulsion": 12.0},
+                        {"seed": 44, "attraction": 0.35, "repulsion": 14.0},
+                        {"seed": 45, "attraction": 0.40, "repulsion": 10.0},
+                        {"seed": 100, "attraction": 0.45, "repulsion": 8.0},
+                    ]
+                    strat = strategies[min(opt_pass, len(strategies) - 1)]
+
                     opt_cfg = PlacementConfig(
-                        seed=42 + opt_pass + 1,
-                        attraction_strength=0.25 + opt_pass * 0.10,
-                        repulsion_strength=12.0,
+                        seed=strat["seed"],
+                        attraction_strength=strat["attraction"],
+                        repulsion_strength=strat["repulsion"],
                         boundary_strength=6.0,
                         convergence_threshold=0.5,
+                        max_iterations=400,  # More iterations
                     )
                     opt_placer = PlacementEngine(opt_cfg)
                     opt_placer.place(board)
 
-                    # Re-route with lower via cost
-                    via_cost = max(15.0, 30.0 - opt_pass * 10)
+                    via_cost = max(10.0, 30.0 - opt_pass * 7)
                     opt_router = AutoRouter(RouterConfig(via_cost=via_cost))
                     all_routed, _ = opt_router.route(board)
 
@@ -367,11 +559,17 @@ class PCBDesignAgent:
                         f"After optimisation pass {opt_pass + 1}: "
                         f"{len(unrouted)} unrouted "
                         f"({unrouted_ratio:.0%})",
-                        progress=0.55 + opt_pass * 0.05,
+                        progress=0.55 + opt_pass * 0.04,
                         board=board,
                     )
 
+                    self._memory.add_note("LAYOUT",
+                        f"Opt pass {opt_pass + 1}: attraction={strat['attraction']}, "
+                        f"via_cost={via_cost}, unrouted={len(unrouted)}")
+
                     if all_routed:
+                        self._chat("agent",
+                                   "All nets routed after optimization!")
                         self._emit(
                             AgentPhase.ROUTING_TRACES,
                             "All nets routed after optimisation!",
@@ -381,6 +579,12 @@ class PCBDesignAgent:
                         break
 
                 if not all_routed:
+                    self._memory.add_note("ERROR",
+                        f"{len(board.get_unrouted_nets())} nets could not be routed. "
+                        "Board may need to be larger or have fewer crossings.")
+                    self._chat("agent",
+                        f"Routing incomplete: {len(board.get_unrouted_nets())} "
+                        f"nets unrouted")
                     self._emit(
                         AgentPhase.ROUTING_TRACES,
                         f"Routing incomplete: {len(board.get_unrouted_nets())} "
@@ -389,10 +593,16 @@ class PCBDesignAgent:
                         board=board,
                     )
 
+            self._update_task("Route traces", "done")
+
             if self._is_cancelled():
                 return None
 
-            # Phase 5: DRC
+            # ── Task 6: DRC ───────────────────────────────────────
+            self._update_task("Run DRC checks", "running")
+            self._chat("task", "Running Design Rule Check...",
+                       task_status="running")
+
             drc_passed = False
             drc_result = None
             for attempt in range(self.config.max_drc_retries + 1):
@@ -414,6 +624,8 @@ class PCBDesignAgent:
                         progress=0.80,
                         board=board,
                     )
+                    self._chat("agent",
+                               f"DRC passed! ({drc_result.warning_count} warnings)")
                     break
                 else:
                     self._emit(
@@ -431,6 +643,9 @@ class PCBDesignAgent:
                     return None
 
             if not drc_passed:
+                self._memory.add_note("ERROR",
+                    f"DRC failed with {drc_result.error_count} errors after "
+                    f"{self.config.max_drc_retries} fix attempts")
                 self._emit(
                     AgentPhase.RUNNING_DRC,
                     "DRC has warnings but proceeding with output generation",
@@ -438,24 +653,27 @@ class PCBDesignAgent:
                     board=board,
                 )
 
-            # Always surface warnings and recommendations, even when
-            # DRC passes -- a "passing" board can still have quality
-            # issues that would make it non-functional in practice.
             if drc_result is not None:
                 warn_detail = drc_result.warnings_detail()
                 if warn_detail:
                     self._emit(
                         AgentPhase.RUNNING_DRC,
-                        (
-                            "Quality review -- issues to check before "
-                            "ordering:"
-                        ),
+                        "Quality review -- issues to check before ordering:",
                         detail=warn_detail,
                         progress=0.81,
                         board=board,
                     )
+                    self._chat("agent",
+                               "Quality warnings found - see details",
+                               detail=warn_detail)
 
-            # Phase 6: Generate manufacturing outputs
+            self._update_task("Run DRC checks", "done")
+
+            # ── Task 7: Generate outputs ──────────────────────────
+            self._update_task("Generate outputs", "running")
+            self._chat("task", "Generating manufacturing files...",
+                       task_status="running")
+
             self._emit(
                 AgentPhase.GENERATING_OUTPUTS,
                 "Generating manufacturing files...",
@@ -465,13 +683,21 @@ class PCBDesignAgent:
             output_dir = Path(self.config.output_dir) / _sanitize_name(board.name)
             generated_files = self._generate_outputs(board, output_dir)
 
+            self._update_task("Generate outputs", "done")
+
+            summary = board.summary()
+            self._chat("agent",
+                "Design complete!",
+                detail=f"Generated {len(generated_files)} files in {output_dir}\n"
+                + "\n".join(f"  {k}: {v}" for k, v in summary.items()))
+
             self._emit(
                 AgentPhase.COMPLETE,
                 "Design complete!",
                 detail=f"Generated {len(generated_files)} files in {output_dir}\n\n"
                 + "\n".join(f"  - {f}" for f in generated_files)
                 + f"\n\nBoard summary:\n"
-                + "\n".join(f"  {k}: {v}" for k, v in board.summary().items()),
+                + "\n".join(f"  {k}: {v}" for k, v in summary.items()),
                 progress=1.0,
                 board=board,
             )
@@ -479,6 +705,8 @@ class PCBDesignAgent:
             return board
 
         except Exception as e:
+            self._chat("agent", f"Design failed: {e}",
+                       task_status="failed")
             self._emit(
                 AgentPhase.FAILED,
                 f"Design failed: {e}",
@@ -777,7 +1005,8 @@ class PCBDesignAgent:
 
     # ─── Custom Design via DesignEngine ─────────────────────────────────
 
-    def _create_custom_design(self, user_request: str) -> Board | None:
+    def _create_custom_design(self, user_request: str,
+                              iteration: int = 1) -> Board | None:
         """Use the DesignEngine to compose a custom board from the request.
 
         If the user explicitly selected an LLM provider (openai / anthropic),
@@ -785,12 +1014,15 @@ class PCBDesignAgent:
         Falls back to the algorithmic DesignEngine only when no LLM is
         configured or the LLM call fails.
 
+        The ``iteration`` parameter tells the LLM which attempt this is,
+        and injects self-notes from previous iterations for learning.
+
         Returns a fully-wired Board on success, or None if the request
         doesn't contain enough actionable detail for the engine.
         """
         # If the user explicitly chose an LLM provider, use it first
         if self.config.llm_provider not in ("template", ""):
-            board = self._generate_from_llm(user_request)
+            board = self._generate_from_llm(user_request, iteration=iteration)
             if board is not None:
                 return board
             # LLM failed -- fall through to DesignEngine as a fallback
@@ -799,6 +1031,8 @@ class PCBDesignAgent:
                 "LLM design failed, falling back to algorithmic engine...",
                 progress=0.06,
             )
+            self._memory.add_error("LLM design failed",
+                "Algorithmic engine may produce simpler but more reliable designs")
 
         try:
             request = parse_request(user_request)
@@ -870,8 +1104,12 @@ class PCBDesignAgent:
             )
             return None
 
-    def _validate_design(self, board: Board) -> None:
-        """Run DesignValidator and log the quality score."""
+    def _validate_design(self, board: Board) -> int:
+        """Run DesignValidator, log the quality score, and learn from issues.
+
+        Returns the score (0-100) for the agentic loop to decide whether
+        to iterate or accept.
+        """
         try:
             validator = DesignValidator()
             score = validator.validate(board)
@@ -887,6 +1125,21 @@ class PCBDesignAgent:
                         f"\n  ... and {len(score.issues) - 8} more issues"
                     )
 
+                # Learn from issues: write self-notes for critical problems
+                for issue in score.issues:
+                    if issue.severity == "critical":
+                        self._memory.add_note(
+                            "ERROR",
+                            f"Critical: {issue.message}",
+                            priority=3,
+                        )
+                    elif issue.severity == "warning":
+                        self._memory.add_note(
+                            "LAYOUT",
+                            f"Warning: {issue.message}",
+                            priority=1,
+                        )
+
             self._emit(
                 AgentPhase.CREATING_SCHEMATIC,
                 f"Design score: {score.total:.0f}/100"
@@ -896,8 +1149,9 @@ class PCBDesignAgent:
                 progress=0.13,
                 board=board,
             )
+            return int(score.total)
         except Exception:
-            pass  # Validation is advisory; don't block the pipeline
+            return 50  # Unknown quality -- don't block the pipeline
 
     # ─── LLM-based Design (thinking-capable models) ─────────────────────
 
@@ -913,14 +1167,15 @@ class PCBDesignAgent:
             return os.environ.get("ANTHROPIC_API_KEY", "")
         return ""
 
-    def _generate_from_llm(self, request: str) -> Board | None:
+    def _generate_from_llm(self, request: str,
+                           iteration: int = 1) -> Board | None:
         """Use a thinking-capable LLM to design a novel PCB from scratch.
 
         The LLM receives the full PCBDesign DSL reference, all available
-        footprints with pin maps, and the subcircuit library.  It then
-        generates Python code that composes a complete board.
+        footprints with pin maps, the subcircuit library, discoverable
+        packages, physics rules, and self-notes from previous iterations.
 
-        Supports OpenAI (o3-mini / o4-mini / gpt-4o) and Anthropic.
+        Supports OpenAI (o4-mini / gpt-4.1 / gpt-4o) and Anthropic.
         Includes a validation-and-retry loop for self-correction.
         """
         provider = self.config.llm_provider
@@ -939,13 +1194,15 @@ class PCBDesignAgent:
 
         self._emit(
             AgentPhase.ANALYZING,
-            "Using AI to design a novel PCB from scratch...",
-            f"Provider: {provider}, model: {self.config.model or 'auto'}",
+            f"Using AI to design PCB (iteration {iteration})...",
+            f"Provider: {provider}, model: {self.config.model or 'o4-mini'}",
             progress=0.04,
         )
+        self._chat("agent",
+                    f"Calling {provider} LLM for design (iteration {iteration})...")
 
         system_prompt = self._build_system_prompt()
-        user_prompt = self._build_user_prompt(request)
+        user_prompt = self._build_user_prompt(request, iteration=iteration)
 
         # Try up to 3 iterations: generate → validate → feedback → retry
         self._last_llm_code = ""
@@ -1050,6 +1307,22 @@ class PCBDesignAgent:
                 fp_details.append(f"  {fp_name}: pins {', '.join(pins)}")
 
         fp_reference = "\n".join(fp_details)
+
+        # Add discoverable packages info
+        discovery_info = ""
+        try:
+            from ..components.discovery import list_discoverable_packages
+            discovery_info = (
+                "\n\n## Dynamic Component Discovery\n\n"
+                "You can use ANY of these packages as footprint names in pcb.place().\n"
+                "They will be auto-created at build time:\n\n"
+                + list_discoverable_packages()
+                + "\n\nYou are NOT limited to the built-in library! If you know a "
+                "component's package type, use it directly (e.g., 'SOIC-8', 'QFN-24', "
+                "'DIP-16', 'TSSOP-20'). The system will generate the correct footprint.\n"
+            )
+        except ImportError:
+            pass
 
         # Get subcircuit library info if available
         subcircuit_info = ""
@@ -1188,6 +1461,7 @@ TO-220 (power package):
 Sensor_I2C_4pin: 1=VCC, 2=GND, 3=SDA, 4=SCL
 Sensor_SPI_6pin: 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
 {subcircuit_info}
+{discovery_info}
 
 ## Component Categories -- Use These Directly with pcb.place()
 
@@ -1315,16 +1589,37 @@ Output ONLY the Python code, no explanations. The code MUST end with:
 board = pcb.build()
 """
 
-    def _build_user_prompt(self, request: str) -> str:
+    def _build_user_prompt(self, request: str,
+                           iteration: int = 1) -> str:
+        # Include physics rules and self-notes from memory
+        notes_section = self._memory.get_notes_for_prompt()
+
+        iteration_context = ""
+        if iteration > 1:
+            iteration_context = (
+                f"\n\n## ITERATION {iteration} - LEARNING FROM PREVIOUS ATTEMPTS\n"
+                f"This is attempt #{iteration}. The previous designs had issues.\n"
+                f"Review the notes below carefully and AVOID the same mistakes.\n"
+                f"Be more creative with component choices and layout.\n"
+            )
+
         return (
             f"Design a complete, manufacturable PCB for this request:\n\n"
             f"{request}\n\n"
+            f"{notes_section}\n"
+            f"{iteration_context}\n"
             f"Think carefully about:\n"
             f"1. What components are needed (MCU, power, sensors, connectors)\n"
-            f"2. Proper power distribution (regulators, decoupling)\n"
-            f"3. Signal connections and pin assignments\n"
-            f"4. Physical layout and component spacing\n"
-            f"5. Board size that fits everything with routing room\n\n"
+            f"2. Proper power distribution (regulators, decoupling) - FOLLOW PHYSICS\n"
+            f"3. Signal connections and pin assignments - VERIFY EACH PIN\n"
+            f"4. Physical layout and component spacing (min 2mm between components)\n"
+            f"5. Board size that fits everything with routing room\n"
+            f"6. Current calculations for LEDs, motors, relays\n"
+            f"7. Voltage levels and level-shifting where needed\n"
+            f"8. EMI/EMC: bypass caps, ground planes, short return paths\n\n"
+            f"You may use ANY component from the dynamic discovery library.\n"
+            f"If you know the right part, use it! Don't limit yourself to the\n"
+            f"built-in components.\n\n"
             f"Generate complete Python code using the PCBDesign DSL.\n"
             f"Include ALL necessary support components.\n"
             f"Output ONLY the Python code."
@@ -1369,8 +1664,8 @@ board = pcb.build()
     ) -> str | None:
         """Call OpenAI API. Supports thinking/reasoning models.
 
-        Default model: ``o3-mini`` (reasoning model -- thinks through
-        circuit design before generating code).
+        Default model: ``o4-mini`` -- an affordable reasoning model
+        that thinks through circuit physics before generating code.
 
         Thinking models (o-series: o1, o3-mini, o4-mini, etc.) use
         a single user message with ``max_completion_tokens`` instead of
@@ -1389,7 +1684,7 @@ board = pcb.build()
             return None
 
         client = openai.OpenAI(api_key=api_key)
-        model = self.config.model or "o3-mini"
+        model = self.config.model or "o4-mini"
 
         # Sanitize prompts to avoid UnicodeEncodeError with some API clients
         system_prompt = self._sanitize_prompt(system_prompt)
