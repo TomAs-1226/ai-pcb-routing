@@ -107,6 +107,33 @@ _PACKAGE_SPECS: dict[str, dict] = {
     "D2PAK": {"pads": 3, "type": "d2pak"},
     # DFN small packages
     "DFN-8": {"pads": 8, "pitch": 0.5, "type": "qfn", "body": 3.0},
+    # BGA family (for ARM SoCs, DDR, etc.)
+    "BGA-64": {"pads": 64, "pitch": 0.8, "type": "bga", "body": 8.0, "rows": 8, "cols": 8},
+    "BGA-100": {"pads": 100, "pitch": 0.8, "type": "bga", "body": 10.0, "rows": 10, "cols": 10},
+    "BGA-144": {"pads": 144, "pitch": 0.8, "type": "bga", "body": 12.0, "rows": 12, "cols": 12},
+    "BGA-169": {"pads": 169, "pitch": 0.8, "type": "bga", "body": 13.0, "rows": 13, "cols": 13},
+    "BGA-196": {"pads": 196, "pitch": 0.8, "type": "bga", "body": 14.0, "rows": 14, "cols": 14},
+    "BGA-256": {"pads": 256, "pitch": 0.8, "type": "bga", "body": 17.0, "rows": 16, "cols": 16},
+    "BGA-324": {"pads": 324, "pitch": 0.65, "type": "bga", "body": 15.0, "rows": 18, "cols": 18},
+    "BGA-400": {"pads": 400, "pitch": 0.65, "type": "bga", "body": 17.0, "rows": 20, "cols": 20},
+    "UFBGA-169": {"pads": 169, "pitch": 0.5, "type": "bga", "body": 7.0, "rows": 13, "cols": 13},
+    "UFBGA-201": {"pads": 201, "pitch": 0.5, "type": "bga", "body": 8.0, "rows": 15, "cols": 15},
+    "WLCSP-25": {"pads": 25, "pitch": 0.4, "type": "bga", "body": 2.5, "rows": 5, "cols": 5},
+    "WLCSP-36": {"pads": 36, "pitch": 0.4, "type": "bga", "body": 3.0, "rows": 6, "cols": 6},
+    # TSOP for DDR memory
+    "TSOP-54": {"pads": 54, "pitch": 0.5, "type": "tssop"},
+    "TSOP-66": {"pads": 66, "pitch": 0.5, "type": "tssop"},
+    # WSON (for flash memory)
+    "WSON-8": {"pads": 8, "pitch": 1.27, "type": "qfn", "body": 5.0},
+    # LQFP larger pin counts
+    "LQFP-100": {"pads": 100, "pitch": 0.5, "type": "qfp"},
+    "LQFP-144": {"pads": 144, "pitch": 0.5, "type": "qfp"},
+    "LQFP-176": {"pads": 176, "pitch": 0.5, "type": "qfp"},
+    "LQFP-208": {"pads": 208, "pitch": 0.5, "type": "qfp"},
+    # QFN larger pin counts
+    "QFN-64": {"pads": 64, "pitch": 0.4, "type": "qfn", "body": 9.0},
+    "QFN-68": {"pads": 68, "pitch": 0.4, "type": "qfn", "body": 9.0},
+    "QFN-72": {"pads": 72, "pitch": 0.4, "type": "qfn", "body": 10.0},
 }
 
 # Map common component names to known packages
@@ -147,6 +174,34 @@ _COMPONENT_PACKAGE_MAP: dict[str, str] = {
     "ATMEGA328P": "DIP-28", "ATTINY85": "DIP-8",
     "ATTINY13": "SOIC-8", "STM32F103C8": "LQFP-48",
     "STM32F401": "LQFP-64", "RP2040": "QFN-56", "SAMD21": "QFP-48",
+    # ARM application processors
+    "STM32MP157": "BGA-196", "STM32MP153": "BGA-196",
+    "STM32MP151": "BGA-196", "STM32H7": "LQFP-144",
+    "STM32F4": "LQFP-100", "STM32F7": "LQFP-144",
+    "STM32L4": "LQFP-64", "STM32G4": "LQFP-48",
+    "IMX6ULL": "BGA-289", "IMX8M": "BGA-400",
+    "ALLWINNER": "BGA-256", "RK3328": "BGA-256",
+    "RK3399": "BGA-400", "AM3358": "BGA-324",
+    "NRF52840": "QFN-48", "NRF52832": "QFN-48",
+    "ESP32S3": "QFN-56", "ESP32C3": "QFN-32",
+    # DDR memory
+    "MT41K256M16": "TSOP-54", "MT41K512M16": "TSOP-54",
+    "AS4C256M16": "TSOP-54", "K4B4G1646": "TSOP-54",
+    # SPI NOR flash
+    "S25FL127": "WSON-8", "W25Q256": "SOIC-8",
+    "MX25L128": "SOIC-8", "IS25LP256": "SOIC-8",
+    # eMMC
+    "THGBMJG6C1LBAIL": "BGA-100",
+    # Ethernet PHY
+    "LAN8720": "QFN-24", "KSZ8081": "QFN-24",
+    "DP83848": "QFP-48", "RTL8211": "QFN-48",
+    # USB PD controllers
+    "STUSB4500": "QFN-24", "FUSB302": "QFN-16",
+    "CYPD3177": "QFN-24",
+    # Power regulators (switching)
+    "TPS54620": "QFN-24", "TPS62172": "WLCSP-36",
+    "TPS65217": "QFN-48", "AXP209": "QFN-48",
+    "TLV70033": "SOT-23-5", "MCP130": "SOT-23",
     # LED drivers
     "WS2811": "SOIC-8", "TLC5940": "DIP-28", "PCA9685": "TSSOP-28",
     # Misc
@@ -258,6 +313,8 @@ def _try_package_spec(name: str) -> Optional[Footprint]:
         return _make_dip_fp(name, spec)
     elif pkg_type in ("to220", "dpak", "d2pak"):
         return _make_power_fp(name, spec)
+    elif pkg_type == "bga":
+        return _make_bga_fp(name, spec)
 
     return None
 
@@ -312,6 +369,38 @@ def _try_pattern_match(name: str) -> Optional[Footprint]:
         spec = _PACKAGE_SPECS.get(pkg)
         if spec:
             return _make_sot_fp(name, spec)
+
+    # Match "BGA-N", "UFBGA-N", "WLCSP-N"
+    m = re.match(r"^(?:UF)?BGA[-_]?(\d+)$", name)
+    if m:
+        n = int(m.group(1))
+        spec = _PACKAGE_SPECS.get(f"BGA-{n}")
+        if spec is None:
+            spec = _PACKAGE_SPECS.get(f"UFBGA-{n}")
+        if spec:
+            return _make_bga_fp(name, spec)
+    m = re.match(r"^WLCSP[-_]?(\d+)$", name)
+    if m:
+        n = int(m.group(1))
+        spec = _PACKAGE_SPECS.get(f"WLCSP-{n}")
+        if spec:
+            return _make_bga_fp(name, spec)
+
+    # Match "LQFP-N" for larger pin counts
+    m = re.match(r"^LQFP[-_]?(\d+)$", name)
+    if m:
+        n = int(m.group(1))
+        spec = _PACKAGE_SPECS.get(f"LQFP-{n}")
+        if spec:
+            return _make_qfp_fp(name, spec)
+
+    # Match "TSOP-N"
+    m = re.match(r"^TSOP[-_]?(\d+)$", name)
+    if m:
+        n = int(m.group(1))
+        spec = _PACKAGE_SPECS.get(f"TSOP-{n}")
+        if spec:
+            return _make_dual_row_fp(name, spec)
 
     return None
 
@@ -556,6 +645,47 @@ def _make_power_fp(name: str, spec: dict) -> Footprint:
             SilkLine(Point(5, 6), Point(-5, 6)),
             SilkLine(Point(-5, 6), Point(-5, -6)),
         ]
+    return Footprint(name=name, pads=pads, silk_lines=silks)
+
+
+def _make_bga_fp(name: str, spec: dict) -> Footprint:
+    """Create BGA (Ball Grid Array) footprints for SoCs, DDR, etc."""
+    n = spec["pads"]
+    pitch = spec["pitch"]
+    body = spec.get("body", 10.0)
+    rows = spec.get("rows", int(n ** 0.5))
+    cols = spec.get("cols", int(n ** 0.5))
+    half_body = body / 2
+    pad_d = pitch * 0.45  # ball diameter ~45% of pitch
+
+    # BGA ball naming: rows = A, B, C, ... columns = 1, 2, 3, ...
+    row_labels = []
+    for i in range(rows):
+        if i < 26:
+            row_labels.append(chr(ord('A') + i))
+        else:
+            row_labels.append(chr(ord('A') + i // 26 - 1) + chr(ord('A') + i % 26))
+
+    pads = []
+    ball_num = 1
+    for r in range(rows):
+        for c in range(cols):
+            if ball_num > n:
+                break
+            x = (c - (cols - 1) / 2) * pitch
+            y = (r - (rows - 1) / 2) * pitch
+            pad_name = f"{row_labels[r]}{c + 1}"
+            pads.append(_make_pad(pad_name, Point(x, y), pad_d, pad_d, PadShape.CIRCLE))
+            ball_num += 1
+
+    silks = [
+        SilkLine(Point(-half_body, -half_body), Point(half_body, -half_body)),
+        SilkLine(Point(half_body, -half_body), Point(half_body, half_body)),
+        SilkLine(Point(half_body, half_body), Point(-half_body, half_body)),
+        SilkLine(Point(-half_body, half_body), Point(-half_body, -half_body)),
+        # Pin A1 marker
+        SilkLine(Point(-half_body + 0.5, -half_body), Point(-half_body, -half_body + 0.5)),
+    ]
     return Footprint(name=name, pads=pads, silk_lines=silks)
 
 

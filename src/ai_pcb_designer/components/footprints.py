@@ -971,6 +971,7 @@ FOOTPRINT_REGISTRY: dict[str, callable] = {
     "PinHeader_2x03": lambda: pin_header_2x(3),
     "PinHeader_2x05": lambda: pin_header_2x(5),
     "PinHeader_2x10": lambda: pin_header_2x(10),
+    "PinHeader_2x20": lambda: pin_header_2x(20),
     # Oscillators
     "Crystal_3215": crystal_3215,
     # Switches

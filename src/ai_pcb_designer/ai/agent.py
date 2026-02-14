@@ -334,16 +334,23 @@ class PCBDesignAgent:
                 board = self._create_custom_design(user_request, iteration)
 
                 if board is None:
-                    # Fallback chain
+                    # Fallback chain -- but ONLY if the request matches
+                    # what the algorithmic engine can actually build.
+                    # The engine only supports ESP32 and basic STM32.
+                    # For anything else (ARM SoCs, custom MCUs, complex
+                    # boards), we must NOT silently produce a generic
+                    # ESP32 board — that would mislead the user.
+                    request_parsed = parse_request(user_request)
+                    is_complex = self._is_complex_request(user_request)
+
                     template_name = self._match_template(user_request)
-                    if template_name:
+                    if template_name and not is_complex:
                         board = create_board_from_template(template_name)
                         self._chat("agent",
                                    f"Used template: {template_name}")
-                    else:
+                    elif not is_complex:
                         try:
                             engine = DesignEngine()
-                            request_parsed = parse_request(user_request)
                             pcb = engine.create_design(request_parsed)
                             board = pcb.build()
                             self._chat("agent",
@@ -355,6 +362,17 @@ class PCBDesignAgent:
                                 "Design engine failed - simplify component count"
                             )
                             board = None
+                    else:
+                        # Complex request that the algorithmic engine
+                        # can't handle — tell the user what happened
+                        self._chat("agent",
+                            "This design requires AI (LLM) generation. "
+                            "The algorithmic engine only supports simple "
+                            "ESP32/STM32 boards. Retrying with LLM...",
+                            task_status="running")
+                        self._memory.add_note("STRATEGY",
+                            "Complex board requested — must use LLM, "
+                            "not algorithmic fallback.", priority=3)
 
                     if board is None:
                         if iteration < max_iters:
@@ -1058,6 +1076,40 @@ class PCBDesignAgent:
 
     # ─── Template Matching ───────────────────────────────────────────────
 
+    @staticmethod
+    def _is_complex_request(request: str) -> bool:
+        """Return True if the request is too complex for DesignEngine.
+
+        The algorithmic DesignEngine only supports ESP32 and basic STM32
+        boards. Requests for ARM application processors, DDR memory,
+        USB PD, Ethernet PHY, multiple power rails, or other advanced
+        features require LLM-generated designs.
+        """
+        low = request.lower()
+        # Keywords that indicate a complex board beyond ESP32/STM32 templates
+        complex_keywords = [
+            # ARM application processors
+            "arm cpu", "arm processor", "cortex-a", "cortex a",
+            "application processor", "coreboard", "core board",
+            "soc", "system on chip",
+            # Specific ARM chips
+            "stm32mp", "imx6", "imx8", "allwinner", "rk3328", "rk3399",
+            "am335", "zynq", "broadcom",
+            # DDR memory
+            "ddr", "ddr3", "ddr4", "sdram", "lpddr",
+            # Complex power management
+            "pd circuit", "power delivery", "usb pd", "usb-pd",
+            "buck converter", "pmic", "power management",
+            "multiple power rail", "multi-rail",
+            # High-speed interfaces
+            "ethernet phy", "mipi", "hdmi", "pcie", "sata",
+            "emmc", "nand flash",
+            # Complex board types
+            "compute module", "system board", "mainboard",
+            "single board computer", "sbc",
+        ]
+        return any(kw in low for kw in complex_keywords)
+
     def _match_template(self, request: str) -> str | None:
         """Match a template only when 2+ keywords hit (strict fallback).
 
@@ -1211,14 +1263,30 @@ class PCBDesignAgent:
             board = self._generate_from_llm(user_request, iteration=iteration)
             if board is not None:
                 return board
-            # LLM failed -- fall through to DesignEngine as a fallback
+            # LLM failed — report clearly
+            llm_error = getattr(self, "_last_llm_error", "unknown")
             self._emit(
                 AgentPhase.ANALYZING,
-                "LLM design failed, falling back to algorithmic engine...",
+                f"LLM design failed: {llm_error}",
                 progress=0.06,
             )
-            self._memory.add_error("LLM design failed",
-                "Algorithmic engine may produce simpler but more reliable designs")
+            self._chat("agent",
+                f"LLM code generation failed: {llm_error}",
+                detail="The AI could not generate valid PCB DSL code. "
+                       "Will try algorithmic fallback if the board is simple enough.")
+            self._memory.add_error(f"LLM design failed: {llm_error}",
+                "Check API key, model, and error above. "
+                "Algorithmic engine can only build simple ESP32/STM32 boards.")
+
+            # For complex requests, do NOT fall through to DesignEngine
+            # because it would produce a wrong board (e.g. ESP32 instead of ARM)
+            if self._is_complex_request(user_request):
+                self._chat("agent",
+                    "This board is too complex for the algorithmic engine. "
+                    "The LLM is required but failed. Please check your API key "
+                    "and try again, or simplify the request.",
+                    task_status="running")
+                return None
 
         try:
             request = parse_request(user_request)
@@ -1568,6 +1636,12 @@ about circuit design before writing code.
 Your task: given a user's PCB description, generate Python code that
 creates a complete, manufacturable board using the PCBDesign DSL.
 
+CRITICAL: You must design the EXACT board the user requested. If they
+ask for an ARM CPU board, design an ARM CPU board with all supporting
+circuits (DDR, flash, power regulators, reset, clocks, etc.). Do NOT
+default to ESP32. Use the dynamic footprint discovery system — you can
+use ANY standard package (BGA, QFN, LQFP, TSSOP, SOIC, etc.) by name.
+
 ## PCBDesign DSL Reference
 
 ```python
@@ -1576,12 +1650,14 @@ from ai_pcb_designer.ai.pcb_dsl import PCBDesign
 pcb = PCBDesign("Board Name", width=70.0, height=55.0, description="...")
 
 # Place a component (returns PlacedComponent for net wiring)
-u1 = pcb.place("U1", "ESP32-WROOM-32", value="ESP32-WROOM-32",
-                pos=(35, 28), description="Main MCU")
+# You can use ANY footprint name — standard packages are auto-discovered:
+# BGA-196, LQFP-144, QFN-48, TSSOP-20, SOIC-8, SOT-23-5, etc.
+u1 = pcb.place("U1", "LQFP-144", value="STM32H743",
+                pos=(35, 28), description="ARM Cortex-M7 MCU")
 r1 = pcb.place("R1", "R_0603", value="10k", pos=(20, 15))
 c1 = pcb.place("C1", "C_0603", value="100nF", pos=(30, 30))
 
-# Connect pins via nets
+# Connect pins via nets — pin numbers depend on the footprint
 pcb.net("SIGNAL", [(u1, "25"), (r1, "2")])     # Signal net
 pcb.power_net("3V3", [(u1, "2"), (c1, "1")])   # Power net (wider trace)
 pcb.power_net("GND", [(u1, "1"), (c1, "2")])   # Ground net
@@ -1673,19 +1749,32 @@ Sensor_SPI_6pin: 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
 
 **Voltage Regulators**:
   SOT-223 - pins: 1=Input, 2=Ground, 3=Output
+  SOT-23-5 - pins: 1=IN, 2=GND, 3=EN, 4=NC, 5=OUT (TLV70033 etc.)
 
-**ICs**:
+**ICs (use ANY of these package names)**:
   ESP32-WROOM-32 - 39-pin WiFi/BT MCU
-  QFP-48 - generic 48-pin IC (STM32, etc.)
-  SOIC-8 - 8-pin SPI flash, op-amp, etc. (pins: 1-8)
-  DIP-8 - through-hole 8-pin IC (pins: 1-8)
+  QFP-48, LQFP-48, LQFP-64, LQFP-100, LQFP-144, LQFP-176, LQFP-208
+  QFN-16, QFN-24, QFN-32, QFN-48, QFN-56, QFN-64, QFN-72
+  SOIC-8, SOIC-14, SOIC-16, SOIC-20, SOIC-24, SOIC-28
+  TSSOP-8, TSSOP-14, TSSOP-16, TSSOP-20, TSSOP-24, TSSOP-28
+  DIP-8, DIP-14, DIP-16, DIP-20, DIP-28, DIP-40
+  BGA-64, BGA-100, BGA-144, BGA-196, BGA-256, BGA-324, BGA-400
+  UFBGA-169, UFBGA-201, WLCSP-25, WLCSP-36
+  TSOP-54, TSOP-66 (for DDR memory)
+  WSON-8 (for SPI flash)
+
+**Dynamic footprint discovery**: You can use component NAMES directly
+  as footprint names — they auto-map to packages:
+  STM32MP157 -> BGA-196, STM32F103C8 -> LQFP-48, RP2040 -> QFN-56,
+  LAN8720 -> QFN-24, MT41K256M16 -> TSOP-54, TPS54620 -> QFN-24,
+  W25Q128 -> SOIC-8, NRF52840 -> QFN-48, etc.
 
 **Connectors**:
   USB_C_16pin - USB-C (A1=GND,A4=VBUS,A6=D+,A7=D-,B1=GND,B4=VBUS,...)
   USB_Micro_B - USB Micro-B (1=VBUS,2=D-,3=D+,4=ID,5=GND)
   BarrelJack_DC - DC jack (1=Tip/VIN, 2=Sleeve/GND, 3=Switch)
   PinHeader_1x02 through PinHeader_1x19 - pin headers (pins: 1,2,3,...)
-  PinHeader_2x03, 2x05, 2x10 - dual-row headers
+  PinHeader_2x03, 2x05, 2x10, 2x20 - dual-row headers
   ScrewTerminal_2P, 3P - screw terminals (pins: 1,2 or 1,2,3)
 
 **Storage / Display**:
@@ -1811,25 +1900,42 @@ board = pcb.build()
             f"{iteration_context}\n"
             f"{proposal_section}\n"
             f"Think carefully about:\n"
-            f"1. What components are needed (MCU, power, sensors, connectors)\n"
+            f"1. What components are needed — design EXACTLY what was requested!\n"
+            f"   If the user asks for ARM, design ARM. If ESP32, design ESP32.\n"
+            f"   Do NOT default to ESP32 for non-ESP32 requests.\n"
             f"2. Proper power distribution (regulators, decoupling) - FOLLOW PHYSICS\n"
+            f"   For complex boards: include ALL power rails (1.2V core, 1.8V I/O,\n"
+            f"   3.3V logic, 5V USB, etc.) with proper buck/LDO regulators\n"
             f"3. Signal connections and pin assignments - VERIFY EACH PIN NUMBER\n"
-            f"   CRITICAL: ESP32-WROOM-32 uses numeric pin numbers 1-39, NOT GPIO names!\n"
-            f"   Pin mapping: IO0=25, IO2=24, IO4=26, IO5=29, IO12=14, IO13=16,\n"
-            f"   IO14=13, IO15=23, IO16=27, IO17=28, IO18=30, IO19=31, IO21=33,\n"
-            f"   IO22=36, IO23=37, IO25=10, IO26=11, IO27=12, IO32=8, IO33=9,\n"
-            f"   IO34=6, IO35=7, EN=3, 3V3=2, GND=1/15/39, TXD0=35, RXD0=34\n"
+            f"   For ESP32-WROOM-32 (pins 1-39): IO0=25, IO2=24, IO4=26, IO5=29,\n"
+            f"   IO12=14, IO13=16, IO14=13, IO15=23, IO16=27, IO17=28, IO18=30,\n"
+            f"   IO19=31, IO21=33, IO22=36, IO23=37, IO25=10, IO26=11, IO27=12,\n"
+            f"   IO32=8, IO33=9, IO34=6, IO35=7, EN=3, 3V3=2, GND=1/15/39\n"
+            f"   For other ICs: use sequential pin numbers (1, 2, 3, ...)\n"
+            f"   For BGA: use grid names (A1, A2, B1, B2, ...)\n"
             f"4. Physical layout and component spacing (min 2mm between components)\n"
             f"5. Board size that fits everything with routing room\n"
+            f"   ARM boards: 80-120mm per side. Complex boards need more space.\n"
             f"6. Current calculations for LEDs, motors, relays\n"
             f"7. Voltage levels and level-shifting where needed\n"
-            f"8. EMI/EMC: bypass caps, ground planes, short return paths\n\n"
+            f"8. EMI/EMC: bypass caps, ground planes, short return paths\n"
+            f"9. ALL supporting circuits — a board MUST work! Include:\n"
+            f"   - Clock sources (crystal oscillators with load caps)\n"
+            f"   - Reset circuits (supervisor IC or RC reset)\n"
+            f"   - Boot config resistors (strapping pins)\n"
+            f"   - Power-on sequence capacitors\n"
+            f"   - ESD protection on external interfaces\n"
+            f"   - Decoupling caps on EVERY power pin\n"
+            f"   - Pull-up/pull-down resistors as required\n\n"
             f"IMPORTANT: Do NOT miss any components. Every IC needs bypass caps.\n"
             f"Every LED needs a current-limiting resistor. Every relay needs a\n"
-            f"transistor driver and flyback diode. Every I2C bus needs pull-ups.\n\n"
-            f"You may use ANY component from the dynamic discovery library.\n"
-            f"If you know the right part, use it! Don't limit yourself to the\n"
-            f"built-in components.\n\n"
+            f"transistor driver and flyback diode. Every I2C bus needs pull-ups.\n"
+            f"For ARM SoCs: include DDR memory, flash, clock, reset, ALL power\n"
+            f"rails, debug header (JTAG/SWD), and decoupling.\n\n"
+            f"You can use ANY standard package as a footprint name:\n"
+            f"BGA-196, LQFP-144, QFN-48, TSSOP-20, SOIC-8, etc.\n"
+            f"You can also use component names directly: STM32MP157, LAN8720,\n"
+            f"MT41K256M16, W25Q128, TPS54620, etc. — they auto-resolve.\n\n"
             f"Generate complete Python code using the PCBDesign DSL.\n"
             f"Include ALL necessary support components.\n"
             f"Output ONLY the Python code."
@@ -1993,7 +2099,7 @@ board = pcb.build()
         try:
             response = client.messages.create(
                 model=model,
-                max_tokens=8192,
+                max_tokens=16000,
                 system=system_prompt,
                 messages=[
                     {"role": "user", "content": user_prompt},

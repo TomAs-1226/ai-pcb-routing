@@ -447,7 +447,8 @@ class Board3DWidget(QWidget):
 
             def draw_comp(p=painter, corners=board_corners,
                          cc_h=comp_h, cc_color=body_color,
-                         cc_ref=comp.reference):
+                         cc_ref=comp.reference,
+                         cc_val=comp.value):
                 # Project all 8 corners (4 top + 4 bottom)
                 top_corners = [project(bx, by, cc_h) for bx, by in corners]
                 bot_corners = [project(bx, by, 0.1) for bx, by in corners]
@@ -499,17 +500,27 @@ class Board3DWidget(QWidget):
                     p.setBrush(QBrush(QColor(255, 255, 255, 180)))
                     p.drawEllipse(QPointF(mx, my), dot_r, dot_r)
 
-                # Reference text on top
+                # Reference + value text on top
                 tcx = sum(pt[0] for pt in top_corners) / 4
                 tcy = sum(pt[1] for pt in top_corners) / 4
                 font = QFont("Monospace", max(5, int(cam.zoom * 0.8)))
                 p.setFont(font)
                 p.setPen(QPen(SILK_COLOR))
                 p.drawText(
-                    QRectF(tcx - 30, tcy - 8, 60, 16),
+                    QRectF(tcx - 40, tcy - 12, 80, 14),
                     Qt.AlignmentFlag.AlignCenter,
                     cc_ref,
                 )
+                # Part value / name below reference
+                if cc_val and cc_val != cc_ref:
+                    font_small = QFont("Monospace", max(4, int(cam.zoom * 0.6)))
+                    p.setFont(font_small)
+                    p.setPen(QPen(QColor(200, 200, 160, 200)))
+                    p.drawText(
+                        QRectF(tcx - 40, tcy + 1, 80, 12),
+                        Qt.AlignmentFlag.AlignCenter,
+                        cc_val,
+                    )
 
             render_items.append((d, draw_comp))
 

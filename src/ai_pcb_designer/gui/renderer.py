@@ -388,10 +388,12 @@ class PCBGraphicsView(QGraphicsView):
                 self._add_to_group("ratsnest", line)
 
     def _draw_references(self, board: Board) -> None:
-        font = QFont("Monospace", 7)
+        font_ref = QFont("Monospace", 7)
+        font_val = QFont("Monospace", 5)
 
         for comp in board.components:
-            text = self._scene.addSimpleText(comp.reference, font)
+            # Reference designator (e.g. "U1")
+            text = self._scene.addSimpleText(comp.reference, font_ref)
             text.setBrush(QBrush(COLORS["text"]))
             text.setPos(
                 comp.position.x * MM_TO_PX - 10,
@@ -399,6 +401,18 @@ class PCBGraphicsView(QGraphicsView):
             )
             text.setZValue(20)
             self._add_to_group("refs", text)
+
+            # Component value / part name (e.g. "AMS1117-3.3", "100nF")
+            label = comp.value or comp.description or ""
+            if label and label != comp.reference:
+                val_text = self._scene.addSimpleText(label, font_val)
+                val_text.setBrush(QBrush(QColor(180, 180, 140, 200)))
+                val_text.setPos(
+                    comp.position.x * MM_TO_PX - 10,
+                    comp.position.y * MM_TO_PX - 6,
+                )
+                val_text.setZValue(20)
+                self._add_to_group("refs", val_text)
 
     def _draw_courtyards(self, board: Board) -> None:
         for comp in board.components:
