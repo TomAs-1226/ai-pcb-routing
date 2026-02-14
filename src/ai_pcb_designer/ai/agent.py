@@ -1483,6 +1483,7 @@ class PCBDesignAgent:
         # Try up to 3 iterations: generate → validate → feedback → retry
         self._last_llm_code = ""
         self._last_llm_error = ""
+        empty_retries = 0  # track consecutive empty responses
         for attempt in range(3):
             try:
                 if provider == "openai":
@@ -1493,26 +1494,51 @@ class PCBDesignAgent:
                     return None
 
                 if not code:
-                    return None
+                    # LLM returned nothing — retry up to 2 times instead of
+                    # immediately giving up (the model may have used all tokens
+                    # for reasoning, or the response was truncated)
+                    empty_retries += 1
+                    err = getattr(self, "_last_llm_error", "") or "empty response"
+                    self._emit(
+                        AgentPhase.ANALYZING,
+                        f"LLM returned no code (attempt {attempt + 1}): {err}",
+                        progress=0.04 + attempt * 0.02,
+                    )
+                    self._chat("agent",
+                        f"LLM attempt {attempt + 1} returned no usable code: {err}")
+                    if empty_retries >= 2:
+                        # Give up after 2 empty responses — likely an API issue
+                        return None
+                    # Add a hint to the prompt asking for just code
+                    user_prompt = (
+                        f"Your previous response was empty or contained no Python code.\n"
+                        f"You MUST respond with ONLY Python code using the PCBDesign DSL.\n"
+                        f"No explanations, no markdown, just the Python code.\n\n"
+                        f"Original request: {request}\n\n"
+                        f"Start your response with:\n"
+                        f"from ai_pcb_designer.ai.pcb_dsl import PCBDesign\n\n"
+                        f"pcb = PCBDesign(...)\n"
+                    )
+                    continue
 
                 board = self._execute_llm_code(code)
                 if board is None:
                     # Code execution failed -- feed the error back to the
                     # LLM so it can self-correct on the next attempt
                     error_msg = getattr(self, "_last_llm_error", "unknown error")
-                    failed_code = getattr(self, "_last_llm_code", "")[:600]
+                    failed_code = getattr(self, "_last_llm_code", "")[:2000]
                     user_prompt = (
                         f"Your previous code FAILED with this error:\n"
                         f"  {error_msg}\n\n"
                         f"The failing code was:\n```python\n{failed_code}\n```\n\n"
                         f"IMPORTANT RULES:\n"
-                        f"- Use pcb.subcircuit('name', pos=(x,y)) to place subcircuits "
-                        f"(ldo_3v3, usb_c_power, esp32_minimal, etc.)\n"
                         f"- Reference designators must be STRINGS: 'R1', 'C1', not R + 1\n"
                         f"- Use pcb.place('ref', 'footprint', ...) for individual components\n"
                         f"- Use pcb.net('name', [(comp, 'pin'), ...]) for signal nets\n"
                         f"- Use pcb.power_net('name', [...]) for power nets (GND, 3V3, etc.)\n"
-                        f"- The code MUST end with: board = pcb.build()\n\n"
+                        f"- Pin numbers must be STRINGS: '1', '2', not integers\n"
+                        f"- The code MUST end with: board = pcb.build()\n"
+                        f"- Output ONLY Python code, no markdown, no explanations\n\n"
                         f"Please fix the error and regenerate COMPLETE code.\n"
                         f"Original request: {request}"
                     )
@@ -1574,28 +1600,27 @@ class PCBDesignAgent:
 
         footprints = list_footprints()
 
-        # Build detailed footprint pin reference
-        fp_details = []
+        # Build compact footprint reference — only list names and pin count,
+        # NOT every individual pin (saves ~1K tokens for the LLM)
+        fp_names = []
         for fp_name in sorted(footprints):
             fp = get_footprint(fp_name)
             if fp:
-                pins = [p.number for p in fp.pads]
-                fp_details.append(f"  {fp_name}: pins {', '.join(pins)}")
+                fp_names.append(f"  {fp_name} ({len(fp.pads)} pins)")
+        fp_reference = "\n".join(fp_names)
 
-        fp_reference = "\n".join(fp_details)
-
-        # Add discoverable packages info
+        # Add discoverable packages info — compact version
         discovery_info = ""
         try:
             from ..components.discovery import list_discoverable_packages
             discovery_info = (
-                "\n\n## Dynamic Component Discovery\n\n"
-                "You can use ANY of these packages as footprint names in pcb.place().\n"
-                "They will be auto-created at build time:\n\n"
-                + list_discoverable_packages()
-                + "\n\nYou are NOT limited to the built-in library! If you know a "
-                "component's package type, use it directly (e.g., 'SOIC-8', 'QFN-24', "
-                "'DIP-16', 'TSSOP-20'). The system will generate the correct footprint.\n"
+                "\n\n## Dynamic Footprint Discovery\n\n"
+                "You can use ANY standard package name as the footprint in pcb.place().\n"
+                "They are auto-created. Examples: SOIC-8, QFN-24, QFN-48, QFN-56,\n"
+                "LQFP-48, LQFP-100, LQFP-144, TSSOP-20, BGA-196, DIP-16, etc.\n\n"
+                "Component names also auto-map: STM32F103C8 -> LQFP-48,\n"
+                "RP2040 -> QFN-56, NRF52840 -> QFN-48, STM32MP157 -> BGA-196,\n"
+                "LAN8720 -> QFN-24, MT41K256M16 -> TSOP-54, W25Q128 -> SOIC-8.\n"
             )
         except ImportError:
             pass
@@ -1700,160 +1725,45 @@ pcb.text("My Board v1.0", pos=(35, 50), font_size=1.5)
 board = pcb.build()
 ```
 
-## Available Footprints (with pin numbers)
+## Available Footprints
 
 {fp_reference}
 
-## Key Pin Maps
+## Pin Maps (use these exact pin STRINGS in net/power_net calls)
 
-ESP32-WROOM-32 (39 pins):
-  1=GND, 2=3V3, 3=EN, 4=SENSOR_VP, 5=SENSOR_VN,
-  6=IO34, 7=IO35, 8=IO32, 9=IO33, 10=IO25,
-  11=IO26, 12=IO27, 13=IO14, 14=IO12, 15=GND,
-  16=IO13, 17=SHD/SD2, 18=SHD/SD3, 19=SCS/CMD,
-  20=SCK/CLK, 21=SDO/SD0, 22=SDI/SD1, 23=IO15,
-  24=IO2, 25=IO0, 26=IO4, 27=IO16, 28=IO17,
-  29=IO5, 30=IO18, 31=IO19, 32=NC, 33=IO21,
-  34=RXD0, 35=TXD0, 36=IO22, 37=IO23, 38=NC, 39=GND
+Passives (R_0402/0603/0805, C_0402/0603/0805, L_0805): pins "1", "2"
+LEDs (LED_0603/0805): "1"=Anode, "2"=Cathode
+SOD-123 (diode): "K"=Cathode, "A"=Anode
+SOT-23-3: "1"=Base/Gate, "2"=Emitter/Source, "3"=Collector/Drain
+SOT-223 (LDO): "1"=Input, "2"=Ground, "3"=Output
+SOT-23-5 (LDO): "1"=IN, "2"=GND, "3"=EN, "4"=NC, "5"=OUT
+USB_C_16pin: A1=GND, A4=VBUS, A5=CC1, A6=D+, A7=D-, A9=VBUS, A12=GND,
+             B1=GND, B4=VBUS, B5=CC2, B6=D+, B7=D-, B9=VBUS, B12=GND
+USB_Micro_B: "1"=VBUS, "2"=D-, "3"=D+, "4"=ID, "5"=GND
+BarrelJack_DC: "1"=Tip/VIN, "2"=Sleeve/GND, "3"=Switch
+SW_Push_6mm: "1","2"=side A, "3","4"=side B;  SW_Push_SMD: "1", "2"
+Crystal_3215: "1", "2"
+OLED_SSD1306: "1"=GND, "2"=VCC, "3"=SCL, "4"=SDA
+MicroSD_Socket: "1"=CS, "2"=MOSI, "3"=VSS, "4"=VDD, "5"=CLK, "7"=DO
+WS2812B: "1"=VDD, "2"=DOUT, "3"=GND, "4"=DIN
+Relay_SPDT: "1"=Coil+, "2"=Coil-, "3"=COM, "4"=NO, "5"=NC
+PinHeader_1xNN / PinHeader_2xNN: sequential "1","2","3"...
+Generic ICs (LQFP/QFN/SOIC/TSSOP/DIP): sequential "1","2","3"...
+BGA packages: grid "A1","A2","B1","B2"...
 
-USB_C_16pin (24 pins):
-  A1=GND, A4=VBUS, A5=CC1, A6=D+, A7=D-,
-  A8=SBU1, A9=VBUS, A12=GND
-  B1=GND, B4=VBUS, B5=CC2, B6=D+, B7=D-,
-  B8=SBU2, B9=VBUS, B12=GND
+ESP32-WROOM-32 (use ONLY if user requests ESP32):
+  1=GND, 2=3V3, 3=EN, 8=IO32, 9=IO33, 10=IO25, 11=IO26, 12=IO27,
+  13=IO14, 14=IO12, 16=IO13, 24=IO2, 25=IO0, 26=IO4, 27=IO16,
+  28=IO17, 29=IO5, 30=IO18, 31=IO19, 33=IO21, 34=RXD0, 35=TXD0,
+  36=IO22, 37=IO23, 39=GND
 
-SOT-223 (LDO like AMS1117):
-  1=Input, 2=Ground, 3=Output
-
-SOT-23 (transistor/MOSFET):
-  1=Base/Gate, 2=Emitter/Source, 3=Collector/Drain
-
-WS2812B (addressable RGB LED):
-  1=VDD(5V), 2=DOUT, 3=GND, 4=DIN
-
-BarrelJack_DC (DC power input):
-  1=Tip(VIN+), 2=Sleeve(GND), 3=Switch(NC)
-
-Relay_SPDT (5V relay):
-  1=Coil+, 2=Coil-, 3=COM, 4=NO, 5=NC
-
-SOD-123 (diode):
-  K=Cathode, A=Anode
-
-DPAK_TO252 (power MOSFET):
-  1=Gate, 2=Drain(tab), 3=Source
-
-DIP-8 (through-hole IC):
-  1-4=left side (top to bottom), 5-8=right side (bottom to top)
-
-TO-220 (power package):
-  1=Pin1, 2=Pin2, 3=Pin3
-
-Sensor_I2C_4pin: 1=VCC, 2=GND, 3=SDA, 4=SCL
-Sensor_SPI_6pin: 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
+Available packages: QFN-16..72, LQFP-48..208, SOIC-8..28, TSSOP-8..28,
+  DIP-8..40, BGA-64..400, TSOP-54/66, WSON-8, USB_C_16pin, USB_Micro_B,
+  BarrelJack_DC, PinHeader_1x02..1x19, PinHeader_2x03/05/10/20,
+  ScrewTerminal_2P/3P, MicroSD_Socket, FPC_8/24/40pin,
+  MountingHole_M3, MountingHole_M2.5
 {subcircuit_info}
 {discovery_info}
-
-## Component Categories -- Use These Directly with pcb.place()
-
-**Passives** (pins: 1, 2):
-  R_0402, R_0603, R_0805 - Resistors
-  C_0402, C_0603, C_0805 - Capacitors
-  L_0805 - Inductor
-
-**LEDs** (pins: 1=Anode, 2=Cathode):
-  LED_0603, LED_0805
-
-**Diodes** (pins: K=Cathode, A=Anode):
-  SOD-123 - Schottky / signal diode
-
-**Addressable LEDs** (pins: 1=VDD, 2=DOUT, 3=GND, 4=DIN):
-  WS2812B
-
-**Transistors / MOSFETs**:
-  SOT-23-3 - pins: 1=Base/Gate, 2=Emitter/Source, 3=Collector/Drain
-  SOT-89 - pins: 1, 2, 3
-  DPAK_TO252 - pins: 1=Gate, 2=Drain(tab), 3=Source
-  TO-220 - pins: 1, 2, 3
-
-**Voltage Regulators**:
-  SOT-223 - pins: 1=Input, 2=Ground, 3=Output
-  SOT-23-5 - pins: 1=IN, 2=GND, 3=EN, 4=NC, 5=OUT (TLV70033 etc.)
-
-**ICs (use ANY of these package names)**:
-  ESP32-WROOM-32 - 39-pin WiFi/BT MCU
-  QFP-48, LQFP-48, LQFP-64, LQFP-100, LQFP-144, LQFP-176, LQFP-208
-  QFN-16, QFN-24, QFN-32, QFN-48, QFN-56, QFN-64, QFN-72
-  SOIC-8, SOIC-14, SOIC-16, SOIC-20, SOIC-24, SOIC-28
-  TSSOP-8, TSSOP-14, TSSOP-16, TSSOP-20, TSSOP-24, TSSOP-28
-  DIP-8, DIP-14, DIP-16, DIP-20, DIP-28, DIP-40
-  BGA-64, BGA-100, BGA-144, BGA-196, BGA-256, BGA-324, BGA-400
-  UFBGA-169, UFBGA-201, WLCSP-25, WLCSP-36
-  TSOP-54, TSOP-66 (for DDR memory)
-  WSON-8 (for SPI flash)
-
-**Dynamic footprint discovery**: You can use component NAMES directly
-  as footprint names — they auto-map to packages:
-  STM32MP157 -> BGA-196, STM32F103C8 -> LQFP-48, RP2040 -> QFN-56,
-  LAN8720 -> QFN-24, MT41K256M16 -> TSOP-54, TPS54620 -> QFN-24,
-  W25Q128 -> SOIC-8, NRF52840 -> QFN-48, etc.
-
-**Connectors**:
-  USB_C_16pin - USB-C (A1=GND,A4=VBUS,A6=D+,A7=D-,B1=GND,B4=VBUS,...)
-  USB_Micro_B - USB Micro-B (1=VBUS,2=D-,3=D+,4=ID,5=GND)
-  BarrelJack_DC - DC jack (1=Tip/VIN, 2=Sleeve/GND, 3=Switch)
-  PinHeader_1x02 through PinHeader_1x19 - pin headers (pins: 1,2,3,...)
-  PinHeader_2x03, 2x05, 2x10, 2x20 - dual-row headers
-  ScrewTerminal_2P, 3P - screw terminals (pins: 1,2 or 1,2,3)
-
-**Storage / Display**:
-  MicroSD_Socket - pins: 1-9 (CS=1, MOSI=2, VSS=3, VDD=4, CLK=5, VSS2=6, DO=7)
-  OLED_SSD1306 - 4-pin I2C OLED (1=GND, 2=VCC, 3=SCL, 4=SDA)
-  FPC_8pin, FPC_24pin, FPC_40pin - flat-flex connectors
-
-**Switches / Relays**:
-  SW_Push_6mm - tactile switch (1,2=side A, 3,4=side B)
-  SW_Push_SMD - SMD pushbutton (1,2)
-  Relay_SPDT - 5V relay (1=Coil+, 2=Coil-, 3=COM, 4=NO, 5=NC)
-
-**Oscillators**:
-  Crystal_3215 - 32.768kHz crystal (1, 2)
-
-**Sensor Headers**:
-  Sensor_I2C_4pin -- 1=VCC, 2=GND, 3=SDA, 4=SCL
-  Sensor_SPI_6pin -- 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
-
-**Mounting**:
-  MountingHole_M3, MountingHole_M2.5 -- (pin: 1)
-
-Example -- OLED display with I2C:
-```python
-oled = pcb.place("U2", "OLED_SSD1306", value="SSD1306", pos=(30, 35))
-pcb.power_net("3V3", [(mcu, "2"), (oled, "2")])
-pcb.power_net("GND", [(mcu, "1"), (oled, "1")])
-pcb.net("I2C_SCL", [(mcu, "36"), (oled, "3")])
-pcb.net("I2C_SDA", [(mcu, "33"), (oled, "4")])
-```
-
-Example -- MicroSD card reader:
-```python
-sd = pcb.place("J2", "MicroSD_Socket", value="MicroSD", pos=(50, 30))
-pcb.net("SD_CS", [(mcu, "29"), (sd, "1")])
-pcb.net("SD_MOSI", [(mcu, "37"), (sd, "2")])
-pcb.net("SD_CLK", [(mcu, "30"), (sd, "5")])
-pcb.net("SD_MISO", [(mcu, "31"), (sd, "7")])
-```
-
-Example -- MOSFET motor driver:
-```python
-q1 = pcb.place("Q1", "SOT-23-3", value="2N7002", pos=(45, 30))
-r_gate = pcb.place("R5", "R_0603", value="100", pos=(42, 28))
-r_pull = pcb.place("R6", "R_0603", value="10k", pos=(42, 32))
-pcb.net("MOTOR_GATE", [(r_gate, "2"), (q1, "1")])
-pcb.net("MOTOR_CTRL", [(mcu, "8"), (r_gate, "1")])
-pcb.power_net("GND", [(q1, "2"), (r_pull, "2")])
-pcb.net("MOTOR_GATE", [(r_pull, "1"), (q1, "1")])
-```
 
 ## Design Rules (CRITICAL)
 
@@ -2069,7 +1979,7 @@ board = pcb.build()
                 response = client.chat.completions.create(
                     model=model,
                     messages=[{"role": "user", "content": combined}],
-                    max_completion_tokens=25000,
+                    max_completion_tokens=50000,
                 )
             else:
                 response = client.chat.completions.create(
@@ -2079,37 +1989,74 @@ board = pcb.build()
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=0.3,
-                    max_tokens=12000,
+                    max_tokens=16000,
                 )
 
+            # Check for response truncation
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason == "length":
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    f"OpenAI response TRUNCATED (hit token limit). "
+                    f"The generated code is incomplete.",
+                )
+                self._last_llm_error = (
+                    "Response truncated — code was cut off mid-generation. "
+                    "The model ran out of output tokens."
+                )
+                # Still try to use partial code — it might work after sanitization
+                content = response.choices[0].message.content
+                if content and len(content.strip()) > 50:
+                    return content
+                return None
+
             content = response.choices[0].message.content
-            return content if content else None
+            if not content or len(content.strip()) < 20:
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    f"OpenAI returned empty/minimal response "
+                    f"(finish_reason={finish_reason}). Model may have "
+                    f"used all tokens for reasoning.",
+                )
+                self._last_llm_error = (
+                    f"LLM returned empty response (finish_reason={finish_reason}). "
+                    f"The model may have spent all tokens on reasoning with no "
+                    f"code output. Will retry."
+                )
+                return None
+
+            return content
 
         except openai.AuthenticationError:
+            self._last_llm_error = "OpenAI authentication failed — check API key"
             self._emit(
                 AgentPhase.ANALYZING,
                 f"OpenAI authentication failed -- check your API key.",
             )
             return None
         except openai.RateLimitError:
+            self._last_llm_error = "OpenAI rate limit hit — try again shortly"
             self._emit(
                 AgentPhase.ANALYZING,
                 f"OpenAI rate limit hit -- try again in a moment.",
             )
             return None
         except openai.BadRequestError as e:
+            self._last_llm_error = f"OpenAI rejected request: {e}"
             self._emit(
                 AgentPhase.ANALYZING,
                 f"OpenAI rejected request: {e}. Try a different model.",
             )
             return None
         except openai.APIConnectionError as e:
+            self._last_llm_error = f"Cannot connect to OpenAI API: {e}"
             self._emit(
                 AgentPhase.ANALYZING,
                 f"Cannot connect to OpenAI API: {e}",
             )
             return None
         except Exception as e:
+            self._last_llm_error = f"OpenAI call failed: {type(e).__name__}: {e}"
             self._emit(
                 AgentPhase.ANALYZING,
                 f"OpenAI call failed: {type(e).__name__}: {e}",
@@ -2155,28 +2102,72 @@ board = pcb.build()
                 ],
             )
 
+            # Check for truncation
+            if response.stop_reason == "max_tokens":
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    f"Anthropic response TRUNCATED (hit max_tokens). "
+                    f"Generated code is incomplete.",
+                )
+                self._last_llm_error = (
+                    "Response truncated — code was cut off. "
+                    "Model hit the max_tokens limit."
+                )
+                # Try partial code if it looks substantial
+                if response.content and response.content[0].text:
+                    text = response.content[0].text
+                    if len(text.strip()) > 50:
+                        return text
+                return None
+
+            if not response.content:
+                self._last_llm_error = (
+                    f"Anthropic returned empty response "
+                    f"(stop_reason={response.stop_reason})."
+                )
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    f"Anthropic returned empty response.",
+                )
+                return None
+
             content = response.content[0].text
-            return content if content else None
+            if not content or len(content.strip()) < 20:
+                self._last_llm_error = (
+                    f"Anthropic returned empty/minimal response "
+                    f"(stop_reason={response.stop_reason})."
+                )
+                self._emit(
+                    AgentPhase.ANALYZING,
+                    f"Anthropic returned empty/minimal response.",
+                )
+                return None
+
+            return content
 
         except anthropic.AuthenticationError:
+            self._last_llm_error = "Anthropic authentication failed — check API key"
             self._emit(
                 AgentPhase.ANALYZING,
                 "Anthropic authentication failed -- check your API key.",
             )
             return None
         except anthropic.RateLimitError:
+            self._last_llm_error = "Anthropic rate limit hit — try again shortly"
             self._emit(
                 AgentPhase.ANALYZING,
                 "Anthropic rate limit hit -- try again in a moment.",
             )
             return None
         except anthropic.APIConnectionError as e:
+            self._last_llm_error = f"Cannot connect to Anthropic API: {e}"
             self._emit(
                 AgentPhase.ANALYZING,
                 f"Cannot connect to Anthropic API: {e}",
             )
             return None
         except Exception as e:
+            self._last_llm_error = f"Anthropic call failed: {type(e).__name__}: {e}"
             self._emit(
                 AgentPhase.ANALYZING,
                 f"Anthropic call failed: {type(e).__name__}: {e}",
@@ -2244,6 +2235,27 @@ board = pcb.build()
             r'\1.power_net(',
             code,
         )
+
+        # If code was truncated, try to add the missing build() call.
+        # Also remove any incomplete last line (truncated mid-statement).
+        code = code.rstrip()
+        if "board" not in code and "pcb" in code:
+            # Code never created a board variable — probably truncated
+            # Remove last line if it looks incomplete (no closing paren/bracket)
+            lines = code.split("\n")
+            while lines:
+                last = lines[-1].rstrip()
+                if not last or last.endswith("\\"):
+                    lines.pop()
+                    continue
+                # Check if line has unbalanced parens/brackets
+                opens = last.count("(") + last.count("[")
+                closes = last.count(")") + last.count("]")
+                if opens > closes:
+                    lines.pop()
+                    continue
+                break
+            code = "\n".join(lines) + "\nboard = pcb.build()\n"
 
         return code
 
