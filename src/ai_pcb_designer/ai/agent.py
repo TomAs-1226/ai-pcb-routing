@@ -85,7 +85,7 @@ class AgentConfig:
       provide your ``api_key`` (or set the ``OPENAI_API_KEY`` /
       ``ANTHROPIC_API_KEY`` environment variable).
 
-      For OpenAI, the default model is ``"o3-mini"`` — a thinking/
+      For OpenAI, the default model is ``"o3-mini"`` -- a thinking/
       reasoning model that plans circuit design before writing code.
       Other good choices: ``"o4-mini"``, ``"o1"``, ``"gpt-4o"``,
       ``"gpt-4.1"``
@@ -179,7 +179,7 @@ class PCBDesignAgent:
                     )
                     board = create_board_from_template(template_name)
                 elif self.config.llm_provider not in ("template", ""):
-                    # LLM was explicitly selected but failed — try the
+                    # LLM was explicitly selected but failed -- try the
                     # algorithmic DesignEngine one more time with the
                     # raw request before giving up.
                     self._emit(
@@ -200,7 +200,7 @@ class PCBDesignAgent:
                         self._emit(
                             AgentPhase.SELECTING_COMPONENTS,
                             "Could not generate a design for this request. "
-                            "Using a simple starter board — please try "
+                            "Using a simple starter board -- please try "
                             "rephrasing with specific components.",
                             progress=0.08,
                         )
@@ -335,7 +335,7 @@ class PCBDesignAgent:
                     self._emit(
                         AgentPhase.PLACING_COMPONENTS,
                         f"Optimisation pass {opt_pass + 1}: "
-                        f"{len(unrouted)} unrouted nets — "
+                        f"{len(unrouted)} unrouted nets -- "
                         f"re-placing and re-routing...",
                         progress=0.50 + opt_pass * 0.05,
                         board=board,
@@ -439,7 +439,7 @@ class PCBDesignAgent:
                 )
 
             # Always surface warnings and recommendations, even when
-            # DRC passes — a "passing" board can still have quality
+            # DRC passes -- a "passing" board can still have quality
             # issues that would make it non-functional in practice.
             if drc_result is not None:
                 warn_detail = drc_result.warnings_detail()
@@ -447,7 +447,7 @@ class PCBDesignAgent:
                     self._emit(
                         AgentPhase.RUNNING_DRC,
                         (
-                            "Quality review — issues to check before "
+                            "Quality review -- issues to check before "
                             "ordering:"
                         ),
                         detail=warn_detail,
@@ -503,7 +503,7 @@ class PCBDesignAgent:
         failure.
         """
         if self._board is None:
-            self._emit(AgentPhase.FAILED, "No board to edit — design one first.")
+            self._emit(AgentPhase.FAILED, "No board to edit -- design one first.")
             return None
 
         if self.config.llm_provider in ("template", ""):
@@ -526,7 +526,7 @@ class PCBDesignAgent:
             if board is None:
                 self._emit(
                     AgentPhase.ANALYZING,
-                    "Edit failed — keeping original board.",
+                    "Edit failed -- keeping original board.",
                 )
                 return self._board
 
@@ -561,7 +561,7 @@ class PCBDesignAgent:
             if not drc_result.passed:
                 self._emit(
                     AgentPhase.FIXING_ISSUES,
-                    f"DRC: {drc_result.error_count} errors — attempting fix...",
+                    f"DRC: {drc_result.error_count} errors -- attempting fix...",
                     progress=0.75,
                 )
                 self._attempt_drc_fix(board, drc_result)
@@ -742,7 +742,7 @@ class PCBDesignAgent:
     def _match_template(self, request: str) -> str | None:
         """Match a template only when 2+ keywords hit (strict fallback).
 
-        Single-keyword matches are too aggressive — "esp32" alone should
+        Single-keyword matches are too aggressive -- "esp32" alone should
         NOT lock the user into the carrier template when they want a
         custom board.
         """
@@ -793,7 +793,7 @@ class PCBDesignAgent:
             board = self._generate_from_llm(user_request)
             if board is not None:
                 return board
-            # LLM failed — fall through to DesignEngine as a fallback
+            # LLM failed -- fall through to DesignEngine as a fallback
             self._emit(
                 AgentPhase.ANALYZING,
                 "LLM design failed, falling back to algorithmic engine...",
@@ -964,7 +964,7 @@ class PCBDesignAgent:
 
                 board = self._execute_llm_code(code)
                 if board is None:
-                    # Code execution failed — feed the error back to the
+                    # Code execution failed -- feed the error back to the
                     # LLM so it can self-correct on the next attempt
                     error_msg = getattr(self, "_last_llm_error", "unknown error")
                     failed_code = getattr(self, "_last_llm_code", "")[:600]
@@ -997,7 +997,7 @@ class PCBDesignAgent:
 
                 # Accept the design if it's feasible OR scores well enough.
                 # LLM-generated designs with minor overlaps (score >= 65)
-                # are still usable — the DRC fix loop will clean them up.
+                # are still usable -- the DRC fix loop will clean them up.
                 if score.is_feasible or score.total >= 65:
                     self._emit(
                         AgentPhase.CREATING_SCHEMATIC,
@@ -1008,7 +1008,7 @@ class PCBDesignAgent:
                     )
                     return board
 
-                # Poor quality — feed errors back to the LLM
+                # Poor quality -- feed errors back to the LLM
                 error_feedback = "\n".join(
                     f"- [{i.severity.upper()}] {i.message}"
                     + (f" | Suggestion: {i.suggestion}" if i.suggestion else "")
@@ -1060,7 +1060,7 @@ class PCBDesignAgent:
                 "Use `pcb.subcircuit()` to place pre-built circuit blocks.\n"
                 "No imports needed, ref numbering is automatic.\n\n"
                 "```python\n"
-                "# Place subcircuits — returns a dict of PlacedComponents\n"
+                "# Place subcircuits -- returns a dict of PlacedComponents\n"
                 "pwr = pcb.subcircuit('usb_c_power', pos=(35, 5))\n"
                 "# pwr keys: 'usb', 'c_filter1', 'c_filter2'\n"
                 "\n"
@@ -1086,16 +1086,16 @@ class PCBDesignAgent:
                 "**CRITICAL: Accessing return dict keys**\n"
                 "The dict keys are component NAMES, NOT net names!\n"
                 "```python\n"
-                "# CORRECT — use component key names from the dict:\n"
+                "# CORRECT -- use component key names from the dict:\n"
                 "pcb.power_net('VBUS', [(pwr['usb'], 'A4'), (ldo['ldo'], '1')])\n"
                 "pcb.power_net('3V3', [(ldo['ldo'], '3'), (mcu['esp32'], '2')])\n"
                 "pcb.net('SDA', [(mcu['esp32'], '33'), (sensor['header'], '3')])\n"
                 "pcb.net('LED_GPIO', [(mcu['esp32'], '8'), (led1['resistor'], '1')])\n"
                 "\n"
-                "# WRONG — these are net names, NOT dict keys:\n"
-                "# ldo['3V3']  ← KeyError! Use ldo['ldo'] instead\n"
-                "# sensor['sensor']  ← KeyError! Use sensor['header'] instead\n"
-                "# mcu['3V3']  ← KeyError! Use mcu['esp32'] instead\n"
+                "# WRONG -- these are net names, NOT dict keys:\n"
+                "# ldo['3V3']  <-- KeyError! Use ldo['ldo'] instead\n"
+                "# sensor['sensor']  <-- KeyError! Use sensor['header'] instead\n"
+                "# mcu['3V3']  <-- KeyError! Use mcu['esp32'] instead\n"
                 "```\n\n"
                 + list_subcircuits()
             )
@@ -1189,66 +1189,66 @@ Sensor_I2C_4pin: 1=VCC, 2=GND, 3=SDA, 4=SCL
 Sensor_SPI_6pin: 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
 {subcircuit_info}
 
-## Component Categories — Use These Directly with pcb.place()
+## Component Categories -- Use These Directly with pcb.place()
 
 **Passives** (pins: 1, 2):
-  R_0402, R_0603, R_0805 — Resistors
-  C_0402, C_0603, C_0805 — Capacitors
-  L_0805 — Inductor
+  R_0402, R_0603, R_0805 - Resistors
+  C_0402, C_0603, C_0805 - Capacitors
+  L_0805 - Inductor
 
 **LEDs** (pins: 1=Anode, 2=Cathode):
   LED_0603, LED_0805
 
 **Diodes** (pins: K=Cathode, A=Anode):
-  SOD-123 — Schottky / signal diode
+  SOD-123 - Schottky / signal diode
 
 **Addressable LEDs** (pins: 1=VDD, 2=DOUT, 3=GND, 4=DIN):
   WS2812B
 
 **Transistors / MOSFETs**:
-  SOT-23-3 — pins: 1=Base/Gate, 2=Emitter/Source, 3=Collector/Drain
-  SOT-89 — pins: 1, 2, 3
-  DPAK_TO252 — pins: 1=Gate, 2=Drain(tab), 3=Source
-  TO-220 — pins: 1, 2, 3
+  SOT-23-3 - pins: 1=Base/Gate, 2=Emitter/Source, 3=Collector/Drain
+  SOT-89 - pins: 1, 2, 3
+  DPAK_TO252 - pins: 1=Gate, 2=Drain(tab), 3=Source
+  TO-220 - pins: 1, 2, 3
 
 **Voltage Regulators**:
-  SOT-223 — pins: 1=Input, 2=Ground, 3=Output
+  SOT-223 - pins: 1=Input, 2=Ground, 3=Output
 
 **ICs**:
-  ESP32-WROOM-32 — 39-pin WiFi/BT MCU
-  QFP-48 — generic 48-pin IC (STM32, etc.)
-  SOIC-8 — 8-pin SPI flash, op-amp, etc. (pins: 1-8)
-  DIP-8 — through-hole 8-pin IC (pins: 1-8)
+  ESP32-WROOM-32 - 39-pin WiFi/BT MCU
+  QFP-48 - generic 48-pin IC (STM32, etc.)
+  SOIC-8 - 8-pin SPI flash, op-amp, etc. (pins: 1-8)
+  DIP-8 - through-hole 8-pin IC (pins: 1-8)
 
 **Connectors**:
-  USB_C_16pin — USB-C (A1=GND,A4=VBUS,A6=D+,A7=D-,B1=GND,B4=VBUS,...)
-  USB_Micro_B — USB Micro-B (1=VBUS,2=D-,3=D+,4=ID,5=GND)
-  BarrelJack_DC — DC jack (1=Tip/VIN, 2=Sleeve/GND, 3=Switch)
-  PinHeader_1x02 through PinHeader_1x19 — pin headers (pins: 1,2,3,...)
-  PinHeader_2x03, 2x05, 2x10 — dual-row headers
-  ScrewTerminal_2P, 3P — screw terminals (pins: 1,2 or 1,2,3)
+  USB_C_16pin - USB-C (A1=GND,A4=VBUS,A6=D+,A7=D-,B1=GND,B4=VBUS,...)
+  USB_Micro_B - USB Micro-B (1=VBUS,2=D-,3=D+,4=ID,5=GND)
+  BarrelJack_DC - DC jack (1=Tip/VIN, 2=Sleeve/GND, 3=Switch)
+  PinHeader_1x02 through PinHeader_1x19 - pin headers (pins: 1,2,3,...)
+  PinHeader_2x03, 2x05, 2x10 - dual-row headers
+  ScrewTerminal_2P, 3P - screw terminals (pins: 1,2 or 1,2,3)
 
 **Storage / Display**:
-  MicroSD_Socket — pins: 1-9 (CS=1, MOSI=2, VSS=3, VDD=4, CLK=5, VSS2=6, DO=7)
-  OLED_SSD1306 — 4-pin I2C OLED (1=GND, 2=VCC, 3=SCL, 4=SDA)
-  FPC_8pin, FPC_24pin, FPC_40pin — flat-flex connectors
+  MicroSD_Socket - pins: 1-9 (CS=1, MOSI=2, VSS=3, VDD=4, CLK=5, VSS2=6, DO=7)
+  OLED_SSD1306 - 4-pin I2C OLED (1=GND, 2=VCC, 3=SCL, 4=SDA)
+  FPC_8pin, FPC_24pin, FPC_40pin - flat-flex connectors
 
 **Switches / Relays**:
-  SW_Push_6mm — tactile switch (1,2=side A, 3,4=side B)
-  SW_Push_SMD — SMD pushbutton (1,2)
-  Relay_SPDT — 5V relay (1=Coil+, 2=Coil-, 3=COM, 4=NO, 5=NC)
+  SW_Push_6mm - tactile switch (1,2=side A, 3,4=side B)
+  SW_Push_SMD - SMD pushbutton (1,2)
+  Relay_SPDT - 5V relay (1=Coil+, 2=Coil-, 3=COM, 4=NO, 5=NC)
 
 **Oscillators**:
-  Crystal_3215 — 32.768kHz crystal (1, 2)
+  Crystal_3215 - 32.768kHz crystal (1, 2)
 
 **Sensor Headers**:
-  Sensor_I2C_4pin — 1=VCC, 2=GND, 3=SDA, 4=SCL
-  Sensor_SPI_6pin — 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
+  Sensor_I2C_4pin -- 1=VCC, 2=GND, 3=SDA, 4=SCL
+  Sensor_SPI_6pin -- 1=VCC, 2=GND, 3=SCK, 4=MOSI, 5=MISO, 6=CS
 
 **Mounting**:
-  MountingHole_M3, MountingHole_M2.5 — (pin: 1)
+  MountingHole_M3, MountingHole_M2.5 -- (pin: 1)
 
-Example — OLED display with I2C:
+Example -- OLED display with I2C:
 ```python
 oled = pcb.place("U2", "OLED_SSD1306", value="SSD1306", pos=(30, 35))
 pcb.power_net("3V3", [(mcu, "2"), (oled, "2")])
@@ -1257,7 +1257,7 @@ pcb.net("I2C_SCL", [(mcu, "36"), (oled, "3")])
 pcb.net("I2C_SDA", [(mcu, "33"), (oled, "4")])
 ```
 
-Example — MicroSD card reader:
+Example -- MicroSD card reader:
 ```python
 sd = pcb.place("J2", "MicroSD_Socket", value="MicroSD", pos=(50, 30))
 pcb.net("SD_CS", [(mcu, "29"), (sd, "1")])
@@ -1266,7 +1266,7 @@ pcb.net("SD_CLK", [(mcu, "30"), (sd, "5")])
 pcb.net("SD_MISO", [(mcu, "31"), (sd, "7")])
 ```
 
-Example — MOSFET motor driver:
+Example -- MOSFET motor driver:
 ```python
 q1 = pcb.place("Q1", "SOT-23-3", value="2N7002", pos=(45, 30))
 r_gate = pcb.place("R5", "R_0603", value="100", pos=(42, 28))
@@ -1293,7 +1293,7 @@ pcb.net("MOTOR_GATE", [(r_pull, "1"), (q1, "1")])
     D=Diode/LED, J=Connector, SW=Switch, H=Mounting Hole, L=Inductor,
     Q=Transistor/MOSFET, K=Relay
 12. For relays: include a flyback diode (SOD-123) and NPN driver
-    transistor (SOT-23-3) — never drive relay coil from GPIO directly
+    transistor (SOT-23-3) -- never drive relay coil from GPIO directly
 13. For power MOSFETs: include gate resistor (100 ohm) + pull-down (10k)
 14. For I2C: include 4.7k pull-ups on SDA and SCL
 15. For barrel jacks: include polarity-protection Schottky diode
@@ -1301,7 +1301,7 @@ pcb.net("MOTOR_GATE", [(r_pull, "1"), (q1, "1")])
 ## Layout Guidelines
 
 - Board origin is top-left (0,0)
-- **SIZE THE BOARD COMPACT** — don't waste space.  Typical boards:
+- **SIZE THE BOARD COMPACT** -- don't waste space.  Typical boards:
   - Simple sensor board: 40x30mm
   - ESP32 + a few peripherals: 50x40mm
   - Complex multi-feature: 70x55mm
@@ -1330,7 +1330,29 @@ board = pcb.build()
             f"Output ONLY the Python code."
         )
 
-    # Known OpenAI reasoning/thinking model prefixes — these use a single
+    @staticmethod
+    def _sanitize_prompt(text: str) -> str:
+        """Strip non-ASCII characters that can crash some API clients.
+
+        Replaces em/en dashes, non-breaking spaces, curly quotes, and
+        any other non-ASCII codepoints with safe ASCII equivalents.
+        """
+        replacements = {
+            "\u2014": "--",  # em dash
+            "\u2013": "-",   # en dash
+            "\u00a0": " ",   # non-breaking space
+            "\u2018": "'",   # left single quote
+            "\u2019": "'",   # right single quote
+            "\u201c": '"',   # left double quote
+            "\u201d": '"',   # right double quote
+            "\u2026": "...", # ellipsis
+        }
+        for char, replacement in replacements.items():
+            text = text.replace(char, replacement)
+        # Final pass: replace any remaining non-ASCII with '?'
+        return text.encode("ascii", "replace").decode("ascii")
+
+    # Known OpenAI reasoning/thinking model prefixes -- these use a single
     # user message (no system role, no temperature param).
     _OPENAI_THINKING_PREFIXES = ("o1", "o3", "o4")
 
@@ -1347,7 +1369,7 @@ board = pcb.build()
     ) -> str | None:
         """Call OpenAI API. Supports thinking/reasoning models.
 
-        Default model: ``o3-mini`` (reasoning model — thinks through
+        Default model: ``o3-mini`` (reasoning model -- thinks through
         circuit design before generating code).
 
         Thinking models (o-series: o1, o3-mini, o4-mini, etc.) use
@@ -1369,6 +1391,10 @@ board = pcb.build()
         client = openai.OpenAI(api_key=api_key)
         model = self.config.model or "o3-mini"
 
+        # Sanitize prompts to avoid UnicodeEncodeError with some API clients
+        system_prompt = self._sanitize_prompt(system_prompt)
+        user_prompt = self._sanitize_prompt(user_prompt)
+
         self._emit(
             AgentPhase.ANALYZING,
             f"Calling {model} for PCB design...",
@@ -1378,7 +1404,7 @@ board = pcb.build()
         try:
             if self._is_thinking_model(model):
                 # Thinking / reasoning models don't support system messages
-                # or temperature — combine into one user message.
+                # or temperature -- combine into one user message.
                 combined = system_prompt + "\n\n---\n\n" + user_prompt
                 response = client.chat.completions.create(
                     model=model,
@@ -1402,13 +1428,13 @@ board = pcb.build()
         except openai.AuthenticationError:
             self._emit(
                 AgentPhase.ANALYZING,
-                f"OpenAI authentication failed — check your API key.",
+                f"OpenAI authentication failed -- check your API key.",
             )
             return None
         except openai.RateLimitError:
             self._emit(
                 AgentPhase.ANALYZING,
-                f"OpenAI rate limit hit — try again in a moment.",
+                f"OpenAI rate limit hit -- try again in a moment.",
             )
             return None
         except openai.BadRequestError as e:
@@ -1449,6 +1475,10 @@ board = pcb.build()
         client = anthropic.Anthropic(api_key=api_key)
         model = self.config.model or "claude-sonnet-4-5-20250929"
 
+        # Sanitize prompts to avoid encoding issues
+        system_prompt = self._sanitize_prompt(system_prompt)
+        user_prompt = self._sanitize_prompt(user_prompt)
+
         self._emit(
             AgentPhase.ANALYZING,
             f"Calling {model} for PCB design...",
@@ -1471,13 +1501,13 @@ board = pcb.build()
         except anthropic.AuthenticationError:
             self._emit(
                 AgentPhase.ANALYZING,
-                "Anthropic authentication failed — check your API key.",
+                "Anthropic authentication failed -- check your API key.",
             )
             return None
         except anthropic.RateLimitError:
             self._emit(
                 AgentPhase.ANALYZING,
-                "Anthropic rate limit hit — try again in a moment.",
+                "Anthropic rate limit hit -- try again in a moment.",
             )
             return None
         except anthropic.APIConnectionError as e:

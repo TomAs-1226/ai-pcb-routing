@@ -210,7 +210,38 @@ class MainWindow(QMainWindow):
         self._progress_bar.setTextVisible(True)
         right_layout.addWidget(self._progress_bar)
 
-        # Step log
+        # Chat / Edit section (right after progress bar for visibility)
+        self._chat_group = QGroupBox("Chat -- Edit Board")
+        chat_layout = QVBoxLayout(self._chat_group)
+
+        self._chat_input = QLineEdit()
+        self._chat_input.setPlaceholderText(
+            "Ask the AI to modify the board... (e.g. 'add a second LED', "
+            "'move U1 to the left', 'remove the debug header')"
+        )
+        self._chat_input.returnPressed.connect(self._on_chat_send)
+        chat_layout.addWidget(self._chat_input)
+
+        self._chat_send_btn = QPushButton("Send Edit")
+        self._chat_send_btn.setMinimumHeight(32)
+        self._chat_send_btn.setStyleSheet(
+            "QPushButton { background-color: #2d6b8c; color: white; "
+            "font-weight: bold; border-radius: 4px; padding: 6px; }"
+            "QPushButton:hover { background-color: #3a8ab0; }"
+            "QPushButton:disabled { background-color: #555; color: #999; }"
+        )
+        self._chat_send_btn.clicked.connect(self._on_chat_send)
+        chat_layout.addWidget(self._chat_send_btn)
+
+        self._chat_group.setVisible(False)  # hidden until first design finishes
+        right_layout.addWidget(self._chat_group)
+
+        # Board info
+        self._board_info = QLabel("No board loaded")
+        self._board_info.setWordWrap(True)
+        right_layout.addWidget(self._board_info)
+
+        # Step log (expandable, takes remaining space)
         log_group = QGroupBox("AI Agent Steps")
         log_layout = QVBoxLayout(log_group)
         self._step_log = QPlainTextEdit()
@@ -220,10 +251,12 @@ class MainWindow(QMainWindow):
             "QPlainTextEdit { background-color: #1a1a2e; color: #eee; }"
         )
         log_layout.addWidget(self._step_log)
-        right_layout.addWidget(log_group)
+        right_layout.addWidget(log_group, 1)  # stretch=1 so it fills remaining space
 
-        # Layer controls
+        # Layer controls (collapsed by default, checkable group box)
         layer_group = QGroupBox("Layer Visibility")
+        layer_group.setCheckable(True)
+        layer_group.setChecked(False)  # collapsed by default
         layer_layout = QVBoxLayout(layer_group)
         self._layer_checkboxes: dict[str, QCheckBox] = {}
 
@@ -249,36 +282,6 @@ class MainWindow(QMainWindow):
             self._layer_checkboxes[key] = cb
 
         right_layout.addWidget(layer_group)
-
-        # Chat / Edit section (visible after design completes)
-        self._chat_group = QGroupBox("Chat — Edit Board")
-        chat_layout = QVBoxLayout(self._chat_group)
-
-        self._chat_input = QLineEdit()
-        self._chat_input.setPlaceholderText(
-            "Ask the AI to modify the board... (e.g. 'add a second LED', "
-            "'move U1 to the left', 'remove the debug header')"
-        )
-        self._chat_input.returnPressed.connect(self._on_chat_send)
-        chat_layout.addWidget(self._chat_input)
-
-        self._chat_send_btn = QPushButton("Send Edit")
-        self._chat_send_btn.setStyleSheet(
-            "QPushButton { background-color: #2d6b8c; color: white; "
-            "font-weight: bold; border-radius: 4px; padding: 6px; }"
-            "QPushButton:hover { background-color: #3a8ab0; }"
-            "QPushButton:disabled { background-color: #555; color: #999; }"
-        )
-        self._chat_send_btn.clicked.connect(self._on_chat_send)
-        chat_layout.addWidget(self._chat_send_btn)
-
-        self._chat_group.setVisible(False)  # hidden until first design finishes
-        right_layout.addWidget(self._chat_group)
-
-        # Board info
-        self._board_info = QLabel("No board loaded")
-        self._board_info.setWordWrap(True)
-        right_layout.addWidget(self._board_info)
 
         splitter.addWidget(right_panel)
         splitter.setSizes([900, 500])
