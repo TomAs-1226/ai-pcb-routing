@@ -587,8 +587,9 @@ class DesignValidator:
     def _check_routing_feasibility(
         self, board: Board, issues: list[DesignIssue]
     ) -> float:
-        """Estimate routing difficulty.
+        """Estimate routing difficulty and penalize unroutable nets.
 
+        * Check for unrouted nets (rats) — these are CRITICAL failures
         * Divide the board into a 10mm grid and count net crossings
           per region to detect congestion hot-spots.
         * Flag nets that span most of the board diagonal.
@@ -600,6 +601,31 @@ class DesignValidator:
         comp_map: dict[str, Component] = {
             c.reference: c for c in board.components
         }
+
+        # ── Check for unrouted nets (the biggest problem!) ────────────
+        try:
+            unrouted = board.get_unrouted_nets()
+            if unrouted:
+                n_unrouted = len(unrouted)
+                n_total = len(board.nets)
+                pct = (n_unrouted / max(n_total, 1)) * 100
+                # Heavy penalty: each unrouted net costs 8 points
+                penalty = min(80, n_unrouted * 8)
+                score -= penalty
+                issues.append(DesignIssue(
+                    category="routing",
+                    severity="critical",
+                    message=(
+                        f"{n_unrouted} of {n_total} nets are UNROUTED "
+                        f"({pct:.0f}%) — board will NOT function"
+                    ),
+                    suggestion=(
+                        "Increase board size, reduce component density, "
+                        "or use a 4-layer stackup to allow more routing"
+                    ),
+                ))
+        except (AttributeError, Exception):
+            pass  # Board may not have this method
 
         grid_size = 10.0
         cols = max(1, int(math.ceil(bw / grid_size)))
@@ -862,19 +888,52 @@ class DesignValidator:
                 score -= 5
 
         # --- Minimum component count check ---
-        if len(board.components) < 3:
+        n_comps = len(board.components)
+        n_nets = len(board.nets)
+
+        if n_comps < 3:
+            issues.append(DesignIssue(
+                category="completeness",
+                severity="critical",
+                message=(
+                    f"Design has only {n_comps} components; "
+                    f"this is an incomplete design"
+                ),
+                suggestion=(
+                    "A typical MCU board needs at minimum: MCU, power "
+                    "regulator, bypass caps, connectors, pull-ups"
+                ),
+            ))
+            score -= 40
+        elif n_comps < 8:
             issues.append(DesignIssue(
                 category="completeness",
                 severity="warning",
                 message=(
-                    f"Design has only {len(board.components)} components; "
-                    f"this seems incomplete"
+                    f"Design has only {n_comps} components and {n_nets} nets; "
+                    f"most boards need more supporting components"
                 ),
                 suggestion=(
-                    "A typical MCU board needs at minimum: MCU, power "
-                    "regulator, bypass caps, connectors"
+                    "Add bypass caps, pull-up resistors, connectors, "
+                    "and protection components"
                 ),
             ))
-            score -= 20
+            score -= 15
+
+        # --- Very few nets relative to components = poor wiring ---
+        if n_comps > 5 and n_nets < n_comps * 0.5:
+            issues.append(DesignIssue(
+                category="completeness",
+                severity="warning",
+                message=(
+                    f"Only {n_nets} nets for {n_comps} components — "
+                    f"many components may be unconnected"
+                ),
+                suggestion=(
+                    "Verify all components are properly wired. "
+                    "Each component should connect to at least power and signal."
+                ),
+            ))
+            score -= 10
 
         return score

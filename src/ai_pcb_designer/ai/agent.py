@@ -48,6 +48,7 @@ from ..exporters.bom import BOMExporter, PickAndPlaceExporter
 from ..exporters.kicad import KiCadExporter
 from ..exporters.assembly import AssemblyDrawingExporter
 from .design_engine import DesignEngine, parse_request
+from ..catalog.lookup import find_for_request, catalog_summary
 from .notes import DesignMemory
 
 
@@ -727,14 +728,35 @@ class PCBDesignAgent:
             self._update_task("Generate outputs", "done")
 
             summary = board.summary()
-            self._chat("agent",
-                "Design complete!",
-                detail=f"Generated {len(generated_files)} files in {output_dir}\n"
-                + "\n".join(f"  {k}: {v}" for k, v in summary.items()))
+
+            # Check for unrouted nets and report them prominently
+            try:
+                final_unrouted = board.get_unrouted_nets()
+                n_unrouted = len(final_unrouted) if final_unrouted else 0
+            except (AttributeError, Exception):
+                n_unrouted = 0
+
+            if n_unrouted > 0:
+                status_msg = (
+                    f"Design generated with {n_unrouted} UNROUTED nets! "
+                    f"Board needs manual routing fixes."
+                )
+                summary["unrouted"] = n_unrouted
+                self._chat("agent", status_msg,
+                    detail=f"Generated {len(generated_files)} files in {output_dir}\n"
+                    + "\n".join(f"  {k}: {v}" for k, v in summary.items())
+                    + f"\n\nWARNING: {n_unrouted} nets could not be routed. "
+                    f"The board will NOT function as-is.")
+            else:
+                self._chat("agent",
+                    "Design complete!",
+                    detail=f"Generated {len(generated_files)} files in {output_dir}\n"
+                    + "\n".join(f"  {k}: {v}" for k, v in summary.items()))
 
             self._emit(
                 AgentPhase.COMPLETE,
-                "Design complete!",
+                "Design complete!" if n_unrouted == 0
+                else f"Design generated — {n_unrouted} unrouted nets!",
                 detail=f"Generated {len(generated_files)} files in {output_dir}\n\n"
                 + "\n".join(f"  - {f}" for f in generated_files)
                 + f"\n\nBoard summary:\n"
@@ -1629,6 +1651,9 @@ class PCBDesignAgent:
         except ImportError:
             pass
 
+        # Get catalog summary for system prompt
+        catalog_info = catalog_summary()
+
         return f"""You are an expert PCB design engineer with deep knowledge of
 electronics, component selection, and PCB layout. You THINK DEEPLY
 about circuit design before writing code.
@@ -1636,11 +1661,15 @@ about circuit design before writing code.
 Your task: given a user's PCB description, generate Python code that
 creates a complete, manufacturable board using the PCBDesign DSL.
 
-CRITICAL: You must design the EXACT board the user requested. If they
-ask for an ARM CPU board, design an ARM CPU board with all supporting
-circuits (DDR, flash, power regulators, reset, clocks, etc.). Do NOT
-default to ESP32. Use the dynamic footprint discovery system — you can
-use ANY standard package (BGA, QFN, LQFP, TSSOP, SOIC, etc.) by name.
+CRITICAL RULES:
+1. Design the EXACT board the user requested — not a generic template.
+2. NEVER default to ESP32 unless the user explicitly asks for ESP32.
+3. Use REAL component part numbers from the catalog provided.
+4. Include ALL supporting circuits: clock, reset, power rails, decoupling,
+   protection, pull-ups, boot config, debug headers.
+5. Connect EVERY net properly — unrouted nets mean the board does not work.
+6. Use the dynamic footprint discovery system — you can use ANY standard
+   package (BGA, QFN, LQFP, TSSOP, SOIC, etc.) by name.
 
 ## PCBDesign DSL Reference
 
@@ -1847,18 +1876,36 @@ pcb.net("MOTOR_GATE", [(r_pull, "1"), (q1, "1")])
 14. For I2C: include 4.7k pull-ups on SDA and SCL
 15. For barrel jacks: include polarity-protection Schottky diode
 
+## Component Catalog
+
+You have access to a catalog of REAL components with actual manufacturer
+part numbers (MPNs). When the user prompt includes a "Recommended Components"
+section, USE THOSE EXACT MPNs as the `value` parameter in pcb.place().
+
+{catalog_info}
+
 ## Layout Guidelines
 
 - Board origin is top-left (0,0)
 - **SIZE THE BOARD COMPACT** -- don't waste space.  Typical boards:
   - Simple sensor board: 40x30mm
-  - ESP32 + a few peripherals: 50x40mm
+  - Medium MCU board: 50x40mm
   - Complex multi-feature: 70x55mm
+  - ARM SoC/DDR board: 80-120mm
 - Connectors go at edges: USB at top center, headers on right
 - Main IC centered: pos=(width/2, 20-30)
 - Passives within 3mm of their IC (decoupling caps < 3mm!)
 - Power section near USB / barrel jack connector
 - Leave 3mm margin from all edges
+
+## CRITICAL: Design Uniqueness
+
+- NEVER generate an ESP32 board unless the user explicitly asks for ESP32
+- NEVER copy template designs -- every design must be UNIQUE to the request
+- Choose the RIGHT MCU for the job: ARM Cortex-M for industrial, ARM Cortex-A
+  for compute, ESP32 for WiFi/IoT, AVR for simple/low-power, RP2040 for hobby
+- Include ALL supporting circuits: clock, reset, power, decoupling, protection
+- Use real component MPNs from the catalog when provided
 
 Output ONLY the Python code, no explanations. The code MUST end with:
 board = pcb.build()
@@ -1893,49 +1940,51 @@ board = pcb.build()
             for note in proposal_notes:
                 proposal_section += f"- {note.content}\n"
 
+        # Get catalog recommendations specific to this request
+        catalog_section = ""
+        try:
+            catalog_recs = find_for_request(request)
+            if catalog_recs:
+                catalog_section = (
+                    f"\n\n{catalog_recs}\n"
+                    f"USE the above real components (MPNs) in your design.\n"
+                    f"Set the `value` param to the MPN, e.g.:\n"
+                    f'  pcb.place("U1", "LQFP-48", value="STM32F103C8T6", ...)\n'
+                    f'  pcb.place("U2", "SOT-223", value="AMS1117-3.3", ...)\n'
+                    f'  pcb.place("R1", "R_0603", value="10K", ...)\n'
+                )
+        except Exception:
+            pass
+
         return (
             f"Design a complete, manufacturable PCB for this request:\n\n"
             f"{request}\n\n"
+            f"{catalog_section}\n"
             f"{notes_section}\n"
             f"{iteration_context}\n"
             f"{proposal_section}\n"
-            f"Think carefully about:\n"
-            f"1. What components are needed — design EXACTLY what was requested!\n"
-            f"   If the user asks for ARM, design ARM. If ESP32, design ESP32.\n"
-            f"   Do NOT default to ESP32 for non-ESP32 requests.\n"
-            f"2. Proper power distribution (regulators, decoupling) - FOLLOW PHYSICS\n"
-            f"   For complex boards: include ALL power rails (1.2V core, 1.8V I/O,\n"
-            f"   3.3V logic, 5V USB, etc.) with proper buck/LDO regulators\n"
-            f"3. Signal connections and pin assignments - VERIFY EACH PIN NUMBER\n"
-            f"   For ESP32-WROOM-32 (pins 1-39): IO0=25, IO2=24, IO4=26, IO5=29,\n"
-            f"   IO12=14, IO13=16, IO14=13, IO15=23, IO16=27, IO17=28, IO18=30,\n"
-            f"   IO19=31, IO21=33, IO22=36, IO23=37, IO25=10, IO26=11, IO27=12,\n"
-            f"   IO32=8, IO33=9, IO34=6, IO35=7, EN=3, 3V3=2, GND=1/15/39\n"
-            f"   For other ICs: use sequential pin numbers (1, 2, 3, ...)\n"
-            f"   For BGA: use grid names (A1, A2, B1, B2, ...)\n"
-            f"4. Physical layout and component spacing (min 2mm between components)\n"
-            f"5. Board size that fits everything with routing room\n"
-            f"   ARM boards: 80-120mm per side. Complex boards need more space.\n"
-            f"6. Current calculations for LEDs, motors, relays\n"
-            f"7. Voltage levels and level-shifting where needed\n"
-            f"8. EMI/EMC: bypass caps, ground planes, short return paths\n"
-            f"9. ALL supporting circuits — a board MUST work! Include:\n"
-            f"   - Clock sources (crystal oscillators with load caps)\n"
-            f"   - Reset circuits (supervisor IC or RC reset)\n"
-            f"   - Boot config resistors (strapping pins)\n"
-            f"   - Power-on sequence capacitors\n"
-            f"   - ESD protection on external interfaces\n"
-            f"   - Decoupling caps on EVERY power pin\n"
-            f"   - Pull-up/pull-down resistors as required\n\n"
-            f"IMPORTANT: Do NOT miss any components. Every IC needs bypass caps.\n"
-            f"Every LED needs a current-limiting resistor. Every relay needs a\n"
-            f"transistor driver and flyback diode. Every I2C bus needs pull-ups.\n"
-            f"For ARM SoCs: include DDR memory, flash, clock, reset, ALL power\n"
-            f"rails, debug header (JTAG/SWD), and decoupling.\n\n"
-            f"You can use ANY standard package as a footprint name:\n"
-            f"BGA-196, LQFP-144, QFN-48, TSSOP-20, SOIC-8, etc.\n"
-            f"You can also use component names directly: STM32MP157, LAN8720,\n"
-            f"MT41K256M16, W25Q128, TPS54620, etc. — they auto-resolve.\n\n"
+            f"## Design Checklist\n\n"
+            f"1. Choose the RIGHT MCU for the request — do NOT default to ESP32!\n"
+            f"   Use the catalog components above. Match MCU to application.\n"
+            f"2. Power supply: include regulators for each voltage rail needed.\n"
+            f"   Add input and output caps on every regulator.\n"
+            f"3. Pin assignments: use sequential pin numbers (1, 2, 3, ...).\n"
+            f"   For ESP32-WROOM-32 specifically: IO0=25, IO2=24, IO4=26, etc.\n"
+            f"   For BGA packages: use grid names (A1, A2, B1, B2, ...).\n"
+            f"4. Component spacing: minimum 2mm between components.\n"
+            f"5. Board size: fit everything with routing room.\n"
+            f"   Simple boards: 40-50mm. Complex: 70-120mm.\n"
+            f"6. Supporting circuits — EVERY board needs these:\n"
+            f"   - Bypass/decoupling caps on EVERY IC power pin (100nF + bulk)\n"
+            f"   - Clock source (crystal + load caps) if MCU needs external clock\n"
+            f"   - Reset circuit (supervisor IC or 10K pull-up + 100nF to GND)\n"
+            f"   - Boot/strapping pin resistors\n"
+            f"   - ESD protection on USB and external connectors\n"
+            f"   - Pull-ups on I2C buses (4.7K)\n"
+            f"   - Current-limiting resistors on LEDs (330R)\n"
+            f"   - Debug header (SWD/JTAG)\n\n"
+            f"7. Connect ALL nets properly — every component pin that needs a\n"
+            f"   connection MUST be in a net. Unrouted nets = non-functional board.\n\n"
             f"Generate complete Python code using the PCBDesign DSL.\n"
             f"Include ALL necessary support components.\n"
             f"Output ONLY the Python code."
