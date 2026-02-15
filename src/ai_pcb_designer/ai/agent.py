@@ -290,6 +290,11 @@ class PCBDesignAgent:
                 self._chat("agent",
                     "Proposed Bill of Materials:",
                     detail=component_proposal)
+                # Store the BOM as a STRATEGY note so the LLM code
+                # generator sees it when building the user prompt
+                self._memory.add_note("STRATEGY",
+                    f"Component proposal for this design:\n{component_proposal}",
+                    priority=5)
                 # Give user a moment to review / intervene
                 import time as _time
                 _time.sleep(0.5)
@@ -1300,14 +1305,25 @@ class PCBDesignAgent:
                 "Check API key, model, and error above. "
                 "Algorithmic engine can only build simple ESP32/STM32 boards.")
 
-            # For complex requests, do NOT fall through to DesignEngine
-            # because it would produce a wrong board (e.g. ESP32 instead of ARM)
-            if self._is_complex_request(user_request):
+            # Check if the LLM generated a detailed BOM proposal.
+            # If so, the DesignEngine would produce a much simpler board
+            # that ignores the BOM — better to block fallback and retry.
+            has_detailed_bom = any(
+                n.category == "STRATEGY" and "component proposal" in n.content.lower()
+                and len(n.content) > 200  # detailed BOM, not a short note
+                for n in self._memory._notes
+            )
+
+            # For complex requests OR when a detailed BOM was generated,
+            # do NOT fall through to DesignEngine — it would produce
+            # a wrong/oversimplified board
+            if self._is_complex_request(user_request) or has_detailed_bom:
                 self._chat("agent",
-                    "This board is too complex for the algorithmic engine. "
-                    "The LLM is required but failed. Please check your API key "
-                    "and try again, or simplify the request.",
+                    "This design requires AI (LLM) generation. "
+                    "The algorithmic engine only supports simple ESP32/STM32 boards. "
+                    "Retrying with LLM...",
                     task_status="running")
+                # Don't return None — let the outer iteration loop retry
                 return None
 
         try:
@@ -1484,7 +1500,7 @@ class PCBDesignAgent:
         self._last_llm_code = ""
         self._last_llm_error = ""
         empty_retries = 0  # track consecutive empty responses
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 if provider == "openai":
                     code = self._call_openai(system_prompt, user_prompt, api_key)
@@ -1531,12 +1547,15 @@ class PCBDesignAgent:
                         f"Your previous code FAILED with this error:\n"
                         f"  {error_msg}\n\n"
                         f"The failing code was:\n```python\n{failed_code}\n```\n\n"
-                        f"IMPORTANT RULES:\n"
+                        f"FIX THE ERROR and regenerate the COMPLETE design.\n"
+                        f"Common mistakes to avoid:\n"
                         f"- Reference designators must be STRINGS: 'R1', 'C1', not R + 1\n"
                         f"- Use pcb.place('ref', 'footprint', ...) for individual components\n"
                         f"- Use pcb.net('name', [(comp, 'pin'), ...]) for signal nets\n"
                         f"- Use pcb.power_net('name', [...]) for power nets (GND, 3V3, etc.)\n"
                         f"- Pin numbers must be STRINGS: '1', '2', not integers\n"
+                        f"- Subcircuit dict access: use .get('key') to avoid KeyError\n"
+                        f"- Do NOT use subcircuits — use pcb.place() for ALL components\n"
                         f"- The code MUST end with: board = pcb.build()\n"
                         f"- Output ONLY Python code, no markdown, no explanations\n\n"
                         f"Please fix the error and regenerate COMPLETE code.\n"
@@ -1630,7 +1649,7 @@ class PCBDesignAgent:
         try:
             from .subcircuits import list_subcircuits
             subcircuit_info = (
-                "\n\n## Subcircuit Convenience Method (PREFERRED)\n\n"
+                "\n\n## Subcircuit Convenience Method (OPTIONAL — prefer pcb.place() for full control)\n\n"
                 "Use `pcb.subcircuit()` to place pre-built circuit blocks.\n"
                 "No imports needed, ref numbering is automatic.\n\n"
                 "```python\n"

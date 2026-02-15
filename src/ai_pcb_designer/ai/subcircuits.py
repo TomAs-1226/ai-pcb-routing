@@ -829,31 +829,36 @@ def mounting_holes_corners(
     board_width: float,
     board_height: float,
 ) -> dict[str, PlacedComponent]:
-    """Mounting holes at board corners with sensible defaults.
+    """Mounting holes at all four board corners.
 
     Placement rules:
     - Inset 5 mm from each edge (enough for M3 screw head + washer)
-    - Small boards (< 45 mm on any side): 2 diagonal holes only
-      (top-left + bottom-right) to save space
-    - Larger boards: 4 holes at all corners
+    - Always places 4 holes (all four corners)
 
     Returned keys:
-        ``hole_tl`` -- top-left (always)
-        ``hole_br`` -- bottom-right (always)
-        ``hole_tr`` -- top-right (large boards only)
-        ``hole_bl`` -- bottom-left (large boards only)
+        ``hole_tl`` -- top-left
+        ``hole_tr`` -- top-right
+        ``hole_br`` -- bottom-right
+        ``hole_bl`` -- bottom-left
     """
     margin = 5.0  # 5mm inset for screw head clearance
 
     comps: dict[str, PlacedComponent] = {}
     idx = 0
 
-    # Always place diagonal pair (most practical for small boards)
     h_tl = pcb.place(
         _ref("H", ref_start, idx), "MountingHole_M3", value="M3",
         pos=(margin, margin), description="M3 mounting hole",
     )
     comps["hole_tl"] = h_tl
+    idx += 1
+
+    h_tr = pcb.place(
+        _ref("H", ref_start, idx), "MountingHole_M3", value="M3",
+        pos=(board_width - margin, margin),
+        description="M3 mounting hole",
+    )
+    comps["hole_tr"] = h_tr
     idx += 1
 
     h_br = pcb.place(
@@ -864,22 +869,12 @@ def mounting_holes_corners(
     comps["hole_br"] = h_br
     idx += 1
 
-    # Add the other two corners only if the board is large enough
-    if board_width >= 45 and board_height >= 45:
-        h_tr = pcb.place(
-            _ref("H", ref_start, idx), "MountingHole_M3", value="M3",
-            pos=(board_width - margin, margin),
-            description="M3 mounting hole",
-        )
-        comps["hole_tr"] = h_tr
-        idx += 1
-
-        h_bl = pcb.place(
-            _ref("H", ref_start, idx), "MountingHole_M3", value="M3",
-            pos=(margin, board_height - margin),
-            description="M3 mounting hole",
-        )
-        comps["hole_bl"] = h_bl
+    h_bl = pcb.place(
+        _ref("H", ref_start, idx), "MountingHole_M3", value="M3",
+        pos=(margin, board_height - margin),
+        description="M3 mounting hole",
+    )
+    comps["hole_bl"] = h_bl
 
     return comps
 
