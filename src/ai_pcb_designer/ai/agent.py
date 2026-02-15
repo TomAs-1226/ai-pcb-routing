@@ -349,12 +349,23 @@ class PCBDesignAgent:
                     request_parsed = parse_request(user_request)
                     is_complex = self._is_complex_request(user_request)
 
+                    # Also check if the LLM already proposed a detailed BOM.
+                    # If so, the DesignEngine would ignore it and produce a
+                    # generic 15-component board — that's worse than retrying.
+                    has_detailed_bom = any(
+                        n.category == "STRATEGY"
+                        and "component proposal" in n.content.lower()
+                        and len(n.content) > 200
+                        for n in self._memory._notes
+                    )
+                    should_block_fallback = is_complex or has_detailed_bom
+
                     template_name = self._match_template(user_request)
-                    if template_name and not is_complex:
+                    if template_name and not should_block_fallback:
                         board = create_board_from_template(template_name)
                         self._chat("agent",
                                    f"Used template: {template_name}")
-                    elif not is_complex:
+                    elif not should_block_fallback:
                         try:
                             engine = DesignEngine()
                             pcb = engine.create_design(request_parsed)
@@ -369,16 +380,16 @@ class PCBDesignAgent:
                             )
                             board = None
                     else:
-                        # Complex request that the algorithmic engine
-                        # can't handle — tell the user what happened
+                        # Detailed BOM or complex request — the algorithmic
+                        # engine can't handle it, keep retrying with LLM
                         self._chat("agent",
                             "This design requires AI (LLM) generation. "
-                            "The algorithmic engine only supports simple "
-                            "ESP32/STM32 boards. Retrying with LLM...",
+                            "The algorithmic engine would produce a generic "
+                            "board ignoring the BOM. Retrying with LLM...",
                             task_status="running")
                         self._memory.add_note("STRATEGY",
-                            "Complex board requested — must use LLM, "
-                            "not algorithmic fallback.", priority=3)
+                            "Must use LLM, not algorithmic fallback — "
+                            "detailed BOM was proposed.", priority=3)
 
                     if board is None:
                         if iteration < max_iters:
@@ -1543,9 +1554,29 @@ class PCBDesignAgent:
                     # LLM so it can self-correct on the next attempt
                     error_msg = getattr(self, "_last_llm_error", "unknown error")
                     failed_code = getattr(self, "_last_llm_code", "")[:2000]
+                    # If error is about an unknown footprint, add the
+                    # available footprint list so the LLM can fix it
+                    footprint_hint = ""
+                    if "Unknown footprint" in error_msg:
+                        footprint_hint = (
+                            f"\nAVAILABLE FOOTPRINTS you can use:\n"
+                            f"  Passives: R_0402, R_0603, R_0805, C_0402, C_0603, C_0805, L_0805\n"
+                            f"  LEDs: LED_0603, LED_0805\n"
+                            f"  SOT: SOT-23-3, SOT-23-5, SOT-23-6, SOT-223, SOT-89\n"
+                            f"  IC: SOIC-8..28, TSSOP-8..28, QFN-8..72, QFP-48..208,\n"
+                            f"      LQFP-48..208, DIP-8..40, BGA-64..400\n"
+                            f"  Connectors: USB_C_16pin, USB_Micro_B, BarrelJack_DC,\n"
+                            f"      PinHeader_1x02..1x19, PinHeader_2x03..2x20\n"
+                            f"  Switches: SW_Push_6mm, SW_Push_SMD\n"
+                            f"  Other: SOD-123, Crystal_3215, OLED_SSD1306, MicroSD_Socket,\n"
+                            f"      MountingHole_M3, ESP32-WROOM-32\n"
+                            f"  ANY standard package (QFN-12, SOIC-10, etc.) is auto-generated.\n"
+                            f"  Use component names directly: BME280, MPU6050, RP2040, etc.\n"
+                        )
                     user_prompt = (
                         f"Your previous code FAILED with this error:\n"
                         f"  {error_msg}\n\n"
+                        f"{footprint_hint}\n"
                         f"The failing code was:\n```python\n{failed_code}\n```\n\n"
                         f"FIX THE ERROR and regenerate the COMPLETE design.\n"
                         f"Common mistakes to avoid:\n"
@@ -1554,7 +1585,6 @@ class PCBDesignAgent:
                         f"- Use pcb.net('name', [(comp, 'pin'), ...]) for signal nets\n"
                         f"- Use pcb.power_net('name', [...]) for power nets (GND, 3V3, etc.)\n"
                         f"- Pin numbers must be STRINGS: '1', '2', not integers\n"
-                        f"- Subcircuit dict access: use .get('key') to avoid KeyError\n"
                         f"- Do NOT use subcircuits — use pcb.place() for ALL components\n"
                         f"- The code MUST end with: board = pcb.build()\n"
                         f"- Output ONLY Python code, no markdown, no explanations\n\n"

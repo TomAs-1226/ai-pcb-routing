@@ -329,29 +329,50 @@ def _try_pattern_match(name: str) -> Optional[Footprint]:
         if spec:
             return _make_passive_fp(name, spec)
 
-    # Match "SOIC-N" or "SOICN"
+    # Match "SOIC-N", "TSSOP-N", "MSOP-N", "SOP-N"
     m = re.match(r"^(SOIC|TSSOP|MSOP|SOP)[-_]?(\d+)$", name)
     if m:
-        pkg = f"{m.group(1)}-{m.group(2)}"
+        pkg_family = m.group(1)
+        n = int(m.group(2))
+        pkg = f"{pkg_family}-{n}"
         spec = _PACKAGE_SPECS.get(pkg)
-        if spec:
-            return _make_dual_row_fp(name, spec)
+        if spec is None:
+            # Auto-generate specs for any dual-row pin count
+            pitch = 1.27 if pkg_family == "SOIC" else 0.65
+            body_w = max(3.9, n * pitch / 4)
+            spec = {"pads": n, "pitch": pitch, "type": "dual",
+                    "body_w": body_w, "span": 6.0 if pkg_family == "SOIC" else 4.4}
+        return _make_dual_row_fp(name, spec)
 
     # Match "QFP-N", "LQFP-N", "TQFP-N"
     m = re.match(r"^[LT]?QFP[-_]?(\d+)$", name)
     if m:
         n = int(m.group(1))
         spec = _PACKAGE_SPECS.get(f"QFP-{n}")
-        if spec:
-            return _make_qfp_fp(name, spec)
+        if spec is None:
+            # Auto-generate specs for any QFP pin count
+            import math
+            pins_per_side = max(2, n // 4)
+            pitch = 0.8 if n <= 48 else (0.5 if n <= 100 else 0.4)
+            body = max(7.0, math.ceil(pins_per_side * pitch + 2.0))
+            spec = {"pads": n, "pitch": pitch, "type": "qfp", "body": body}
+        return _make_qfp_fp(name, spec)
 
-    # Match "QFN-N"
-    m = re.match(r"^QFN[-_]?(\d+)$", name)
+    # Match "QFN-N", "DFN-N"
+    m = re.match(r"^[D]?QFN[-_]?(\d+)$", name)
+    if not m:
+        m = re.match(r"^DFN[-_]?(\d+)$", name)
     if m:
         n = int(m.group(1))
         spec = _PACKAGE_SPECS.get(f"QFN-{n}")
-        if spec:
-            return _make_qfn_fp(name, spec)
+        if spec is None:
+            # Auto-generate specs for any QFN pin count
+            import math
+            pins_per_side = max(2, n // 4)
+            pitch = 0.65 if n <= 16 else (0.5 if n <= 48 else 0.4)
+            body = max(3.0, math.ceil(pins_per_side * pitch + 1.0))
+            spec = {"pads": n, "pitch": pitch, "type": "qfn", "body": body}
+        return _make_qfn_fp(name, spec)
 
     # Match "DIP-N"
     m = re.match(r"^DIP[-_]?(\d+)$", name)
